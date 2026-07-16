@@ -101,10 +101,12 @@ class Retriever(nn.Module):
             h_id_tensor,
             t_id_tensor
         ], dim=0)
+
         reverse_edge_index = torch.stack([
             t_id_tensor,
             h_id_tensor
         ], dim=0)
+        
         dde_list = self.dde(topic_entity_one_hot, edge_index, reverse_edge_index)
         h_e_list.extend(dde_list)
         h_e = torch.cat(h_e_list, dim=1)

@@ -1,0 +1,5 @@
+The rational path for identifying symptoms associated with sepsis is:
+
+1. sepsis -> has_symptom -> confusion
+
+Explanation: This path directly connects the diagnosis (sepsis) to the symptom (confusion), which is a common symptom that can be observed in sepsis patients. Confusion is often a recognized symptom of sepsis due to its impact on cognitive function and overall health status.

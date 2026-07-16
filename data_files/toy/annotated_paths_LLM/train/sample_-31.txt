@@ -1,0 +1,9 @@
+The rational paths for identifying the treatment for pneumonia are as follows:
+
+1. **Pneumonia -> Treated By -> Corticosteroids**
+   - This path directly identifies that pneumonia is being treated with corticosteroids (corticosteroids), which is a common treatment for respiratory infections like pneumonia.
+
+2. **Pneumonia -> Has Symptom -> Hypertension -> Tackled By -> Corticosteroids**
+   - This path involves identifying symptoms (hypertension) and then determining the cause (hypertension leading to pneumonia). It logically leads to the conclusion that hypertension is causing or contributing to the pneumonia.
+
+Both of these paths provide clear and direct information about the treatment for pneumonia based on the given information.

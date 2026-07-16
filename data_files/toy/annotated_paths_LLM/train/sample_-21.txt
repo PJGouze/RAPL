@@ -1,0 +1,5 @@
+The rational path for identifying symptoms associated with sepsis is:
+
+1. sepsis -> has_symptom -> fever
+
+Explanation: Fever is often one of the first signs or symptoms that can be observed in patients with sepsis. It is a common and immediate sign that indicates an infection has occurred and requires medical attention. Therefore, if someone exhibits fever as part of their initial presentation, it is reasonable to conclude that they have sepsis.

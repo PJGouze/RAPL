@@ -10,7 +10,7 @@ In summary, RAPL improves generalization in KGQA through three key aspects:
 
 We use `webqsp` as an example. One can replace it with `cwq`.
 
-First run:
+First, to load the dataset,  run:
 ```
 CUDA_VISIBLE_DEVICES=0 python emb.py --dataset webqsp
 ```
@@ -33,7 +33,7 @@ Before processing the PyG dataset, make sure `data/$dataset$/raw` is organized a
 
 ```
 - raw
-  - annotated_path_GPT4o
+  - annotated_path_GPT4o 
   - gte-large-en-v1.5
   - processed
 ```
@@ -64,7 +64,7 @@ After model training, we can perform inference to get the reasoning path, and lo
 CUDA_VISIBLE_DEVICES=0 python model_inference.py --num_layers 2 --dataset_name webqsp --bidirectional --split test --use_stop_mlp --wandb_id webqsp;
 ```
 ## Generate answers using LLM reasoner
-Finally, we can use the LLM reasoner to generate answers for each question, given the retrived reasoning chains from previous step. We use Llama-3.1-8B as a example. 
+Finally, we can use the LLM reasoner to generate answers for each question, given the retrieved reasoning chains from previous step. We use Llama-3.1-8B as a example. 
 ```
 CUDA_VISIBLE_DEVICES=0 python generate_answers_llama31_8b.py --file_dir $file_dir$
 ```

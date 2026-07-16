@@ -1,0 +1,5 @@
+The rational path for identifying symptoms associated with sepsis is:
+
+1. sepsis -> has_symptom -> headache
+
+Explanation: This path directly connects the diagnosis (sepsis) to the symptom (headache). It follows the logical sequence where if someone is diagnosed with sepsis, it would be expected that they might have headaches as one of their symptoms.

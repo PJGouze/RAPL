@@ -86,7 +86,7 @@ if __name__ == '__main__':
     for split in ['train']:
         print (f"post process dataset:{name}, {split} part")
         print ('using GT4o labels')
-        post_processed_dir = f"data/post_processed_pathLabel/{name}/"  #! use pathLabel_4o_mini or pathLabel, remember to chaneg it to 4o if needed
+        post_processed_dir = f"data/post_processed_pathLabel/{name}/"  #! use pathLabel_4o_mini or pathLabel, remember to change it to 4o if needed
         dset = KGDataset(root=f'data/{name}/',split=split)
         
         raw_dataset=dset

@@ -13,15 +13,59 @@ class EmbInferDataset:
         skip_no_ans=True
     ):
         """
+        Dataset for preparing knowledge graph samples for embedding inference.
+
+        This class preprocesses a raw question-answering dataset by converting
+        entities and relations into integer identifiers, separating entities with
+        meaningful textual descriptions from identifier-only entities, and caching
+        the processed dataset to disk.
+
+        Each processed sample contains all information required to generate entity
+        and relation embeddings and to build the corresponding graph structure.
+
         Parameters
         ----------
+        raw_set : list
+            List of raw samples. Each sample must contain at least the following
+            fields:
+
+            - ``id`` : sample identifier.
+            - ``question`` : natural language question.
+            - ``graph`` : list of triples ``(head, relation, tail)``.
+            - ``q_entity`` : list of question/topic entities.
+            - ``a_entity`` : list of answer entities.
+            - ``answer`` : list of answer entities (must be identical to
+            ``a_entity``).
+
         entity_identifiers : set
-            Set of entity identifiers, e.g., m.06w2sn5, for which we cannot
-            get meaningful text embeddings.
-        skip_no_topic : bool
-            Whether to skip samples without topic entities in the graph.
-        skip_no_ans : bool
-            Whether to skip samples without answer entities in the graph.
+            Set of entity identifiers that do not have meaningful textual
+            descriptions (for example Freebase identifiers such as ``m.06w2sn5``).
+            These entities are separated from textual entities so that they can be
+            embedded differently.
+
+        save_path : str
+            Path to the pickle file used to cache the processed dataset. If the
+            file already exists, the processed data are loaded directly instead of
+            being recomputed.
+
+        skip_no_topic : bool, default=True
+            Whether to discard samples that do not contain any question/topic
+            entity after preprocessing.
+
+        skip_no_ans : bool, default=True
+            Whether to discard samples that do not contain any answer entity after
+            preprocessing.
+
+        Attributes
+        ----------
+        processed_dict_list : list
+            List of processed samples.
+
+        no_topic_cnt : int
+            Number of discarded samples without topic entities.
+
+        no_ans_cnt : int
+            Number of discarded samples without answer entities.
         """
         self.processed_dict_list = self._process(
             raw_set,
@@ -54,6 +98,31 @@ class EmbInferDataset:
         entity_identifiers,
         save_path
     ):
+        """
+        Process all samples in the dataset and optionally cache the result.
+
+        If a cached version of the processed dataset exists, it is loaded
+        directly from disk. Otherwise, every sample is processed individually
+        using :meth:`_process_sample` and the resulting list is serialized with
+        pickle.
+
+        Parameters
+        ----------
+        raw_set : list
+            Raw dataset.
+
+        entity_identifiers : set
+            Set of entities considered identifier-only (without meaningful
+            textual descriptions).
+
+        save_path : str
+            Path where the processed dataset should be saved.
+
+        Returns
+        -------
+        list
+            List of processed sample dictionaries.
+        """
         if os.path.exists(save_path):
             with open(save_path, 'rb') as f:
                 return pickle.load(f)
@@ -77,6 +146,46 @@ class EmbInferDataset:
         sample,
         entity_identifiers
     ):
+        """
+        Convert a raw sample into its processed representation.
+
+        The preprocessing performs the following operations:
+
+        - extracts all entities and relations from the graph,
+        - separates textual entities from identifier-only entities,
+        - assigns deterministic integer identifiers,
+        - converts graph triples into integer ID format,
+        - maps question and answer entities to their corresponding IDs.
+
+        Parameters
+        ----------
+        sample : dict
+            Raw sample containing a question, graph, topic entities and answer
+            entities.
+
+        entity_identifiers : set
+            Set of entities that should be considered identifier-only.
+
+        Returns
+        -------
+        dict
+            Dictionary containing the processed sample with the following keys:
+
+            - ``id`` : sample identifier.
+            - ``question`` : question text.
+            - ``q_entity`` : original topic entities.
+            - ``q_entity_id_list`` : topic entity IDs.
+            - ``text_entity_list`` : entities with textual descriptions.
+            - ``non_text_entity_list`` : identifier-only entities.
+            - ``relation_list`` : sorted relation list.
+            - ``h_id_list`` : head node IDs.
+            - ``r_id_list`` : relation IDs.
+            - ``t_id_list`` : tail node IDs.
+            - ``a_entity`` : original answer entities.
+            - ``a_entity_id_list`` : answer entity IDs.
+            - ``id2entities`` : mapping from entity IDs to entity names.
+            - ``id2relations`` : mapping from relation IDs to relation names.
+        """
         # Model input (0) question
         question = sample['question']
         
@@ -94,6 +203,10 @@ class EmbInferDataset:
         # Parition the entities based on if the associated text is meaningful.
         # Model input (1) text of entities
         #             (2) number of entities without text
+        """
+        Considering the toy KG or the adapted KG, there is no use in registering the non textual entities
+
+        Previous code : 
         text_entity_list = []
         non_text_entity_list = []
         for entity in entity_list:
@@ -101,7 +214,10 @@ class EmbInferDataset:
                 non_text_entity_list.append(entity)
             else:
                 text_entity_list.append(entity)
-
+        """
+        text_entity_list = entity_list
+        non_text_entity_list = []
+        
         # Create entity IDs.
         entity2id = dict()
         entity_id = 0
@@ -126,7 +242,7 @@ class EmbInferDataset:
 
 
         # Convert triples to entity and relation IDs.
-        # Model input (4) triples in th ID space for
+        # Model input (4) triples in the ID space for
         # graph construction and embedding indexing
         h_id_list = []
         r_id_list = []
@@ -173,6 +289,25 @@ class EmbInferDataset:
         return len(self.processed_dict_list)
     
     def __getitem__(self, i):
+        """
+        Retrieve the information required for embedding inference.
+
+        Parameters
+        ----------
+        i : int
+            Index of the sample.
+
+        Returns
+        -------
+        tuple
+            A tuple containing:
+
+            - **id** (*str or int*) : sample identifier.
+            - **q_text** (*str*) : question text.
+            - **text_entity_list** (*list*) : entities with textual
+              descriptions.
+            - **relation_list** (*list*) : relations appearing in the graph.
+        """
         sample = self.processed_dict_list[i]
         
         id = sample['id']

@@ -16,6 +16,7 @@ from src.config.retriever import load_yaml
 from src.dataset.retriever_v2 import RetrieverDataset, collate_retriever
 from src.model.retriever import Retriever
 from src.setup import set_seed, prepare_sample
+from RAPL.src.model.llms import TransformersLLM
 
 import transformers
 
@@ -24,10 +25,16 @@ import pickle
 import re
 from copy import deepcopy as dp
 from termcolor import colored
-import openai
+#import openai
 
 import warnings
 warnings.filterwarnings("ignore")
+
+import yaml
+
+def load_config(path):
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
 
 def dict_to_text(data):
     """
@@ -90,19 +97,20 @@ def convert_messages_to_response_text(messages):
 
     return response_text.strip()
 
-def chat(args):
+def LLM_answering(args):
     # Set your OpenAI API key
-    key_id = args.which_key
-    if key_id == 0:
-        print ('type your key id here')
-        openai.api_key = "xxx"
+    #key_id = args.which_key
+    #if key_id == 0:
+     #   print ('type your key id here')
+     #   openai.api_key = "xxx"
 
     train_split_id = args.train_part
     dataset = args.dataset
-    
+    #Loading the datasets containing the retrieved path from the data pickles
     path_tr = f"data_files/{dataset}/processed/train_text_dict_list.pickle"
     path_val = f"data_files/{dataset}/processed/val_text_dict_list.pickle"
-    path_val = f"data_files/{dataset}/processed/test_text_dict_list.pickle"
+    path_test = f"data_files/{dataset}/processed/test_text_dict_list.pickle"
+    
     with open(path_tr, "rb") as f:
         train_data = pickle.load(f)
     with open(path_val, "rb") as f:
@@ -111,6 +119,7 @@ def chat(args):
     #     val_data = pickle.load(f)  #! remember to change back
     print (f"val data len: {len(val_data)}")
     
+
     # Define the system and prompt as per the original function
     first_prompt = """
     For the QA task, follow the following template to answer the question and list the rational paths:
@@ -150,18 +159,19 @@ def chat(args):
     train_samples = [dict_to_text(train_data[i][i]) for i in range(N_tr)]
     val_samples = [dict_to_text(val_data[i][i]) for i in range(N_val)]
 
-    # Messages to pass for the GPT API
+    # Messages to pass for the GPT API or the local LLM
     messages = [
         {"role": "user", "content": first_prompt},
         {"role": "assistant", "content": first_response},
         {"role": "user", "content": job_start}
     ]
 
-    cnt = 0
+    count = 0
     SLEEP_TIME = 60  # Adjust this value if needed based on your rate limit
-    # Process training set
-    save_path = f"data_files/{dataset}/annotated_paths_GPT4o/train/"
+    ### Process training set, these commands create the folder storing the processed training set
+    save_path = f"data_files/{dataset}/annotated_paths_LLM/train/"
     os.makedirs(save_path, exist_ok=True)
+    # preparing the splitting 
     split_size = N_tr // 3
     start_idx = split_size * train_split_id
     end_idx = split_size * (train_split_id + 1) if train_split_id < 2 else N_tr
@@ -171,42 +181,60 @@ def chat(args):
     else:
         samples_to_process = train_samples[start_idx:end_idx]
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    llm = TransformersLLM(
+                model_name="Qwen/Qwen2.5-0.5B-Instruct", #Qwen/Qwen3.5-35B-A3B-FP8
+                device=device
+                )
+    
     for idx, sample in tqdm(enumerate(samples_to_process)):
         if os.path.exists(save_path + f'sample_{start_idx + idx}.txt'): 
             print(colored(f"sample_{start_idx + idx}.txt already exists, skipping", 'red'))
             continue
         print(colored(f"Processing sample {start_idx + idx}/{N_tr} \n", 'yellow'))
         
-        # Prepare GPT messages
+        # Prepare LLM messages
         copy_messages = dp(messages)
         copy_messages.append({"role": "user", "content": sample})
 
         # Request GPT-4o response
         try:
             # Request GPT-4o response
-            response = openai.ChatCompletion.create(
-                model="gpt-4o",  # Specify GPT-4o
-                messages=copy_messages,
-                temperature=0.,  # Adjust for deterministic output
-            )
+            #responseGPT = openai.ChatCompletion.create(
+             #   model="gpt-4o",  # Specify GPT-4o
+              #  messages=copy_messages,
+               # temperature=0.,  # Adjust for deterministic output
+            #)
+
+            #config = load_yaml("config_llm.yaml")
+            #responseLLM = TransformersLLM(
+            #model_name=config["llm"]["model_name"],
+            #device=config["llm"]["device"]
+            #)
+
+            answer = llm.generate(copy_messages)
+
+            
 
             # Extract and save the response
-            s = response["choices"][0]["message"]["content"]
+            #anwers = responseGPT["choices"][0]["message"]["content"]
+
             with open(save_path + f'sample_{start_idx + idx}.txt', 'w') as f:
-                f.write(s)
-            cnt += 1
+                f.write(answer)
+            count += 1
             
-        except openai.error.RateLimitError as e:
+        #except openai.error.RateLimitError as e:
             # Handle rate limit error: Wait and try again
-            print(colored(f"Rate limit reached, retrying after {SLEEP_TIME} seconds...", 'red'))
-            time.sleep(SLEEP_TIME)  # Sleep for the specified time
-            continue  # Retry the current sample
+         #   print(colored(f"Rate limit reached, retrying after {SLEEP_TIME} seconds...", 'red'))
+          #  time.sleep(SLEEP_TIME)  # Sleep for the specified time
+           # continue  # Retry the current sample
 
         except Exception as e:
             # Handle other exceptions: Wait 180 seconds before retrying
             print(colored(f"Error encountered: {e}. Retrying after 60 seconds...", 'cyan'))
             time.sleep(60)
-        print ('processed sample count:',cnt)
+        print ('processed sample count:',count)
 
 
 if __name__ == '__main__':
@@ -214,12 +242,12 @@ if __name__ == '__main__':
     
     parser = ArgumentParser()
     parser.add_argument('-d', '--dataset', type=str, default='webqsp',
-                        choices=['webqsp', 'cwq'], help='Dataset name')
+                        choices=['webqsp', 'cwq','toy'], help='Dataset name')
     parser.add_argument('--train_part', type=int, default=-1,
                         choices=[-1,0,1,2], help='-1 mean make the entire train dataset')
     parser.add_argument('--which_key', type=int, default=0,
                         choices=[0], help='which openai key to use')
     args = parser.parse_args()
-    chat(args)
+    LLM_answering(args)
     
     

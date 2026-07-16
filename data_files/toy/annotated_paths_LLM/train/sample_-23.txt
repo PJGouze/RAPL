@@ -1,0 +1,5 @@
+The rational path for identifying symptoms associated with pneumonia is:
+
+1. pneumonia -> has_symptom -> cough
+
+Explanation: This path directly connects the diagnosis (pneumonia) to the symptom (cough), which is a common and reliable method for determining the presence or absence of a particular symptom based on the given information.
