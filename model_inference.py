@@ -14,7 +14,7 @@ import torch.nn.functional as F
 # from src.model.Trainer import Trainer
 from src.model.Trainerv3 import Trainer
 from src.dataset.PyG_dataset_disk import KGDataset
-from src.dataset.PostProcessedDataset import ProcessedDiskDataset
+from RAPL.src.dataset.PostProcessedDataset import ProcessedDiskDataset
 from src.dataset.utils import load_pickles,decode_path,decode_topic_nodes
 from termcolor import colored
 import wandb
@@ -132,7 +132,8 @@ def main():
     parser.add_argument("--num_layers", type=int, default=2, help="Number of GNN layers.")
     parser.add_argument("--num_heads", type=int, default=4, help="Number of heads in GAT.")
     parser.add_argument("--K", type=int, default=3, help="K for SGConv.")
-    parser.add_argument("--in_dims", type=int, default=3072, help="Input node feature dimension.")
+    parser.add_argument("--in_dims", type=int, default=1152, help="Input node feature dimension.")
+    parser.add_argument("--emb_size", type=int, default=384, help="Input sentence transormer embedding dimensions")
     parser.add_argument("--hidden_dims", type=int, default=512, help="Hidden dimension size in GNN.")
     parser.add_argument("--out_dims", type=int, default=512, help="Output dimension for GNN.")
     parser.add_argument("--batch_norm", action="store_true", help="Use batch normalization if set.")
@@ -142,8 +143,8 @@ def main():
     parser.add_argument("--device", type=int, default=0, help="GPU device index. Use -1 for CPU.")
     
     # Add dataset-related arguments
-    parser.add_argument("--dataset_name", type=str, default="webqsp", help="Name or path of the dataset.")
-    parser.add_argument("--split", type=str, default="train", help="Dataset split: train, val, test.")
+    parser.add_argument("--dataset_name", type=str, default="toy", help="Name or path of the dataset.")
+    parser.add_argument("--split", type=str, default="test", help="Dataset split: train, val, test.")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for the DataLoader.")
     
     parser.add_argument("--pathTrainAfterEpoch", type=int, default=1, help="start training path loss after #epoch")
@@ -165,8 +166,9 @@ def main():
     # -------------------------
     # 1. load datasets
     # -------------------------    
-    null_dset = KGDataset(root=f'data/{args.dataset_name}/',split=args.split)
-    dset = ProcessedDiskDataset(processed_dir=f'data/post_processed_pathLabel_4o_corrected/{args.dataset_name}/',split=args.split) #! use 4o or 4o-mini as path label
+    null_dset = KGDataset(root=f'data_files/{args.dataset_name}/',split=args.split)
+    processed_dir = f'data_files/{args.dataset_name}/processed'
+    dset = ProcessedDiskDataset(processed_dir,split=args.split)
     color_print(f"Created DataLoader with batch_size={args.batch_size}.",'red')
 
 
@@ -176,6 +178,11 @@ def main():
     # Map device: if args.device==-1, use CPU; else GPU
 
     device = args.device if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available() and args.device >= 0:
+        device = torch.device(f"cuda:{args.device}")
+    else:
+        device = torch.device("cpu")
+
     color_print (f"use_device:{device}",'red')
     args.device = device
     args = vars(args)
@@ -189,9 +196,28 @@ def main():
     # **Load model states from model_dir if exists
     #! model trained using different teacher supervision
     # 2-layer
-    model_dir = f"xxx.pt" # best model path
+    model_dir = '/mnt/beegfs/home/pjgouze/RAPL-env/RAPL/experiments/toy/saved_models/1/GCN_bidirectional_True_numLayers_2_useStopMlp_True_numHeads_4_K_3/seed_1/epoch_15_trainLoss_0.2537.pt'
+    # model_dir = '/home/pjgouze/Documents/RAPL-env/seed_1/val_set/model_epoch_8_f1_1.0000.pt'
     if os.path.exists(model_dir):
         trainer.load_state_dict(torch.load(model_dir,map_location='cpu'),strict=False)
+
+        checkpoint = torch.load(
+                        model_dir,
+                        map_location=device
+                    )
+
+        missing, unexpected = trainer.load_state_dict(
+                                    checkpoint,
+                                    strict=False
+                                )
+
+        print("\nMissing keys:")
+        for x in missing:
+            print("  ", x)
+
+        print("\nUnexpected keys:")
+        for x in unexpected:
+            print("  ", x)
         color_print(f"Loaded model states from {model_dir}.", 'green')
     else:
         color_print(f"No model states found at {model_dir}.", 'yellow')
@@ -203,6 +229,7 @@ def main():
     total_triples = 0.
     KM = [(800,1200)]
     triplet_cnt_dict = {}
+    #I don't know where this comes from :
     triplet_cnt_dir = f"experiments/text_from_KG/{args['wandb_id']}/{args['dataset_name']}/"
     decoding_time = []
     sample_num_triples = []
@@ -211,7 +238,7 @@ def main():
         save_dir = f"experiments/text_from_KG/{args['wandb_id']}/{args['dataset_name']}/K_{k}_M_{m}/GCN_bidirectional_True_numLayers_2_useStopMlp_True_numHeads_4_K_3/seed_1/"
         os.makedirs(save_dir, exist_ok=True)
         cnt = 0
-        for i in tqdm(range(len(dset))):
+        for i in tqdm(range(N_dset)):
             # if file exists continue
             if os.path.exists(os.path.join(save_dir, f"sample_{i}.txt")): 
                 print (f"sample_{i}.txt exists, continue")
@@ -224,8 +251,11 @@ def main():
                 res = trainer.decoding(dset[i], retrieval_list[i], metadata_list[i], K=k, N=3,M=m,way='normal')
                 e = time.time()
                 decoding_time.append(e-s)
-            except:
-                continue
+            except Exception as e:
+                print(f"\nERROR ON SAMPLE {i}")
+                print("Question:", retrieval_list[i]["question"])
+                print("Exception:", repr(e))
+                raise
             # print (f"question:{question}")
             # print (f"gt paths:{gt_path}")
             res,num_triples = transform_and_deduplicate_paths(res[0])

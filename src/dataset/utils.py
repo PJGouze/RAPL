@@ -6,6 +6,7 @@ from torch_geometric.data import Data
 import ast
 import re
 from termcolor import colored
+import pathlib
 
 
 
@@ -83,16 +84,26 @@ def load_pickles(split, dataset):
     retrieval_list : list of dict
         A list of dictionaries loaded from {raw_dir}/processed/{split}_retrieval.pkl
         (or generated from {raw_dir}/processed/{split}_id_entity_mapping.pkl if necessary),
-        typically containing 'question', 'id2entities', and 'id2relations'.
+        typically containing 'question', 'id2entities', and 'id2relations'. Present in {split}_retrieval.pkl with current framework.
 
-    metadata_list : list of dict
+    metadata_list : list of dictopen(raw_retrieval_file, 'rb')
         A list of dictionaries loaded from {processed_dir}/{split}/metadata_{split}.pkl,
-        where each element has keys: 'relation_id', 'h_id', and 't_id'.
+        where each element has keys: 'relation_id', 'h_id', and 't_id'. Also present in {split}_retrieval.pkl with current framework
     """
     # File paths
-    raw_retrieval_file = os.path.join(dataset.raw_dir, 'processed', f'{split}_retrieval.pkl')
-    retrieval_file = os.path.join(dataset.raw_dir, 'processed', f'{split}_id_entity_mapping.pkl')
-    metadata_file = os.path.join(dataset.processed_dir, split, f'metadata_{split}.pkl')
+    # raw_retrieval_file = os.path.join(dataset.raw_dir, 'processed', f'{split}_retrieval.pkl')
+    # retrieval_file = os.path.join(dataset.raw_dir, 'processed', f'{split}_id_entity_mapping.pkl')
+    # metadata_file = os.path.join(dataset.processed_dir, split, f'metadata_{split}.pkl')
+    root = pathlib.Path().resolve()
+    #debugging
+    # raw_retrieval_file = os.path.join(root,'RAPL', dataset.processed_dir, f'{split}_retrieval.pkl')
+    # retrieval_file = os.path.join(root, 'RAPL', dataset.processed_dir, f'{split}_retrieval.pkl')
+    # metadata_file = os.path.join(root, 'RAPL', dataset.processed_dir, f'{split}_retrieval.pkl')
+    #cluster
+    raw_retrieval_file = os.path.join(root, dataset.processed_dir, f'{split}_retrieval.pkl')
+    retrieval_file = os.path.join(root, dataset.processed_dir, f'{split}_retrieval.pkl')
+    metadata_file = os.path.join(root, dataset.processed_dir, split,  f'metadata_{split}.pkl')
+
 
     # Step 1: Load retrieval data (process from raw file if necessary)
     if os.path.exists(retrieval_file):
@@ -121,6 +132,7 @@ def load_pickles(split, dataset):
             pickle.dump(retrieval_list, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     # Step 2: Load metadata
+
     with open(metadata_file, 'rb') as f:
         metadata_list = pickle.load(f)  # list of dicts
 

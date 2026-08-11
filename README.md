@@ -10,7 +10,7 @@ In summary, RAPL improves generalization in KGQA through three key aspects:
 
 We use `webqsp` as an example. One can replace it with `cwq`.
 
-First run:
+First, to load the dataset,  run:
 ```
 CUDA_VISIBLE_DEVICES=0 python emb.py --dataset webqsp
 ```
@@ -43,11 +43,8 @@ Finally, make the PyG dataset:
 ```
 CUDA_VISIBLE_DEVICES=0 python load_post_processed_dataset.py --name webqsp
 ```
-This will make the training set for webqsp, using previous saved pickle files. For valid and test set, we use:
-```
-CUDA_VISIBLE_DEVICES=0 python load_post_processed_dataset_test.py --name webqsp
-```
-This does not require rational path and relation labelling.
+This will make the training set for toy, using previous saved pickle files.
+
 
 Now we have a PyG dataset, and we can directly apply a GNN model on it. 
 
@@ -55,16 +52,16 @@ Now we have a PyG dataset, and we can directly apply a GNN model on it.
 
 With the obtained PyG dataset, we can train the graph retriever as follows:
 ```
-CUDA_VISIBLE_DEVICES=0 python main.py --num_layers 2 --dataset_name webqsp --epochs 15 --bidirectional --use_stop_mlp
+CUDA_VISIBLE_DEVICES=0 python main.py --num_layers 2 --dataset_name OntoOmicsKG_step2 --epochs 15 --bidirectional --use_stop_mlp
 ```
 
 ## Inference
 After model training, we can perform inference to get the reasoning path, and load the pickle file to map the nodes into triples.
 ```
-CUDA_VISIBLE_DEVICES=0 python model_inference.py --num_layers 2 --dataset_name webqsp --bidirectional --split test --use_stop_mlp --wandb_id webqsp;
+CUDA_VISIBLE_DEVICES=0 python model_inference.py --num_layers 2 --dataset_name toy --bidirectional --split test --use_stop_mlp --wandb_id toy;
 ```
 ## Generate answers using LLM reasoner
-Finally, we can use the LLM reasoner to generate answers for each question, given the retrived reasoning chains from previous step. We use Llama-3.1-8B as a example. 
+Finally, we can use the LLM reasoner to generate answers for each question, given the retrieved reasoning chains from previous step. We use Llama-3.1-8B as a example.
 ```
 CUDA_VISIBLE_DEVICES=0 python generate_answers_llama31_8b.py --file_dir $file_dir$
 ```

@@ -1,3 +1,4 @@
+#load_post_processed_dataset.py, update : 03/08 9:30
 import numpy as np
 import os
 import sys
@@ -9,7 +10,7 @@ import wandb
 
 from collections import defaultdict
 from torch.optim import Adam
-from torch_geometric.loader import DataLoader
+#from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
 from src.config.retriever import load_yaml
@@ -18,7 +19,6 @@ from src.model.retriever import Retriever
 from src.dataset.utils import *
 from src.dataset.PyG_dataset_disk import KGDataset
 from src.dataset.PostProcessedDataset import ProcessedDiskDataset
-# from src.dataset.PostProcessedDataset import ProcessedDiskDataset
 import pickle
 import warnings
 import argparse
@@ -80,34 +80,61 @@ def _collect_annotated_paths(folder_path):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Process dataset name.')
-    parser.add_argument('--name', type=str, default='webqsp', help='Name of the dataset')
+    parser.add_argument('--name', type=str, default='toy', help='Name of the dataset')
     args = parser.parse_args()
     name = args.name
-    for split in ['train']:
+
+
+    for split in ['train', 'val','test']:
         print (f"post process dataset:{name}, {split} part")
-        print ('using GT4o labels')
-        post_processed_dir = f"data/post_processed_pathLabel/{name}/"  #! use pathLabel_4o_mini or pathLabel, remember to chaneg it to 4o if needed
-        dset = KGDataset(root=f'data/{name}/',split=split)
+        print ('using LLM labels')
+        post_processed_dir = os.path.join(
+                                        f"data_files/{name}",
+                                        "final"
+                                    )
+        kgdataset = KGDataset(root=f'data_files/{name}/',split=split)
+
         
-        raw_dataset=dset
-        raw_dir = f"data/{name}/raw/"
-        processed_dir = f"data/{name}/processed"
+
+        # raw_dir = f"data_files/{name}/raw/"
+        # processed_dir = f"data_files/{name}/processed"
+
+        base_dir = f"data_files/{name}"
+        processed_dir = os.path.join(base_dir, "processed")
+        annotated_dir = os.path.join(base_dir, "annotated_paths_LLM")
+        final_dir = os.path.join(base_dir, "final")
+
         print ('loading retrieval files')
-        with open(f"{raw_dir}/processed/{split}_retrieval.pkl", 'rb') as f:
+        with open(os.path.join(processed_dir, f"{split}_retrieval.pkl"), "rb") as f:
             retrieval_list = pickle.load(f)
         print ('loading annotated text path labels')
 
-        text_labels = _collect_annotated_paths(f"{raw_dir}/annotated_paths_GPT4o/{split}")  #! GPT4o-mini or GPT4o
+
+
+        text_labels = _collect_annotated_paths(
+            os.path.join(annotated_dir, split)
+        )
+
+        # Replacing "metadata file by the files that contain the h,r and t_id_list, which is used in the metadata file"
         print ('loading metadata files')
-        with open(f"{processed_dir}/{split}/metadata_{split}.pkl", 'rb') as f:
-            metadata_list = pickle.load(f)
         
-        print (len(text_labels),len(metadata_list),len(retrieval_list)) # type: ignore
-        assert len(text_labels)==len(metadata_list)==len(retrieval_list) # type: ignore
+        # with open(f"{processed_dir}/{split}/metadata_{split}.pkl", 'rb') as f:
+        #     metadata_list = pickle.load(f)
         
-        print (f"start making {split} datasets")
-        labeled_topic_relation_path=f"data_files/{name}/topic_relation_candidates/{split}_results.pkl"
-        post_dataset = ProcessedDiskDataset(post_processed_dir, split, raw_dataset, labeled_topic_relation_path,retrieval_list=retrieval_list,metadata_list=metadata_list,text_labels=text_labels)
+        # print (len(text_labels),len(metadata_list),len(retrieval_list)) # type: ignore
+        # assert len(text_labels)==len(metadata_list)==len(retrieval_list) # type: ignore
+
+        print (f"start making final {split} datasets")
+        labeled_topic_relation_path=f"data_files/{name}/relationtargeting/{split}_results.pkl"
+        post_dataset = ProcessedDiskDataset(processed_dir, split, kgdataset, labeled_topic_relation_path,retrieval_list=retrieval_list,metadata_list=None,text_labels=text_labels)
         print (post_dataset[0])
-    
+        print(post_dataset[0].keys())
+        data = post_dataset[0]
+        print("num_nodes", data.num_nodes)
+        print(len(data.one_hop_neighbors))
+        print("topic_candidates", data.topic_candidates.sum())
+        print("topic labels:", data.topic_labels.sum())
+        print("LLM labels:", data.llm_topic_labels.sum())
+        print("preprocessing achieved")
+
     

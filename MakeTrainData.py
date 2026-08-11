@@ -59,53 +59,134 @@ def get_sorted_paths(val, top_k=10):
 
 
 def main(args):
+    """
+    Build and serialize path-augmented datasets for retriever training.
+
+    This script loads a configuration file, initializes train/validation/test
+    datasets using `RetrieverDataset`, extracts and sorts candidate reasoning
+    paths for each question, and saves them into pickle files for downstream
+    use (e.g., training a text-based retriever or reranker).
+
+    The pipeline processes each split independently and stores structured
+    question-level representations enriched with:
+    - translated paths
+    - reasoning paths
+    - path distances
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Command-line arguments containing at least:
+        - ``dataset``: dataset name (e.g., ``webqsp``, ``cwq``, ``toy``, ''OntoOmicsKG_step2'')
+
+    Workflow
+    --------
+    1. Load YAML configuration from:
+        configs/retriever/<dataset>.yaml
+
+    2. Set environment:
+        - GPU device
+        - number of threads
+        - random seed
+
+    3. Initialize experiment folder using timestamp and config prefix.
+
+    4. For each split (train / val / test):
+        - Load `RetrieverDataset`
+        - Iterate over samples
+        - Extract sorted candidate paths via `get_sorted_paths`
+        - Build per-question dictionaries containing:
+            - question text
+            - translated paths
+            - reasoning paths
+            - path distances
+
+    5. Serialize processed outputs into:
+        - train_text_dict_list.pickle
+        - val_text_dict_list.pickle
+        - test_text_dict_list.pickle
+
+    Outputs
+    -------
+    None
+        Files are written to:
+        data_files/<dataset>/processed/
+
+    Notes
+    -----
+    - Train and validation splits are processed with default settings.
+    - Test split is processed with `skip_no_path=False`.
+    - Each sample is stored as a dictionary keyed by its index.
+    - This script is intended as a preprocessing entry point before training.
+    """
+
     # Modify the config file for advanced settings and extensions.
     config_file = f'configs/retriever/{args.dataset}.yaml'
     config = load_yaml(config_file)
     
-    device = torch.device('cuda:0')
+    #device = torch.device('cuda:0')
     torch.set_num_threads(config['env']['num_threads'])
     set_seed(config['env']['seed'])
 
-    ts = time.strftime('%b%d-%H:%M:%S', time.gmtime())
+    time_stamp = time.strftime('%b%d-%H:%M:%S', time.gmtime())
     config_df = pd.json_normalize(config, sep='/')
     exp_prefix = config['train']['save_prefix']
-    exp_name = f'{exp_prefix}_{ts}'
+    exp_name = f'{exp_prefix}_{time_stamp}'
 
     os.makedirs(exp_name, exist_ok=True)
-    train_set = RetrieverDataset(config=config, split='train')
-
-    
-    N = len(train_set)
     train_dict_list = []
     val_dict_list = []
     test_dict_list = []
-    # # train data
+
+    #Getting or creating the validation dataset with the candidate paths as supervision signal
+    train_set = RetrieverDataset(config=config, split='train')
     print ('train_data processing')
+    N = len(train_set)
     for i in tqdm(range(N)):
         train_dict = {}
         sample = train_set[i]
         sorted_translated_paths, sorted_reasoning_paths, sorted_distances = get_sorted_paths(sample)
         question = sample['question']
-        train_dict[i]= {'question': question, 'translated_paths': sorted_translated_paths, 'reasoning_paths': sorted_reasoning_paths, 'path_distances': sorted_distances}
+        train_dict[i]= {'question': question,
+                        'translated_paths': sorted_translated_paths,
+                        'reasoning_paths': sorted_reasoning_paths,
+                        'path_distances': sorted_distances,
+                        'cand_relations': sample['relation_list'],
+                        'gt_relations':sorted({
+                                                rel
+                                                for path in sorted_reasoning_paths
+                                                for rel in path
+                                            })
+                                            }
         train_dict_list.append(train_dict)
     
     
-    # # val data
+    #Getting or creating the validation dataset with the candidate paths as supervision signal
     val_set = RetrieverDataset(config=config, split='val')
-    print ('valid_data processing')
+    print ('validation_data processing')
     N = len(val_set)
     for i in tqdm(range(N)):
         val_dict = {}
         sample = val_set[i]
         sorted_translated_paths, sorted_reasoning_paths, sorted_distances = get_sorted_paths(sample)
         question = sample['question']
-        val_dict[i]= {'question': question, 'translated_paths': sorted_translated_paths, 'reasoning_paths': sorted_reasoning_paths, 'path_distances': sorted_distances}
+        val_dict[i]= {'question': question,
+                        'translated_paths': sorted_translated_paths,
+                        'reasoning_paths': sorted_reasoning_paths,
+                        'path_distances': sorted_distances,
+                        'cand_relations': sample['relation_list'],
+                        'gt_relations': sorted({
+                                                rel
+                                                for path in sorted_reasoning_paths
+                                                for rel in path
+                                            })
+                                            }
         val_dict_list.append(val_dict)
     
     
     save_path = f"data_files/{args.dataset}/processed/"
     os.makedirs(save_path, exist_ok=True)
+
     # save pickle to save_path
     with open(save_path + 'train_text_dict_list.pickle', 'wb') as f:
         pickle.dump(train_dict_list, f)
@@ -115,6 +196,7 @@ def main(args):
     
     save_path = f"data_files/{args.dataset}/processed/"
 
+    #Getting or creating the validation dataset with the candidate paths
     test_set = RetrieverDataset(config=config, split='test',skip_no_path=False)
     print ('test_data processing')
     N = len(test_set)
@@ -123,8 +205,19 @@ def main(args):
         sample = test_set[i]
         sorted_translated_paths, sorted_reasoning_paths, sorted_distances = get_sorted_paths(sample)
         question = sample['question']
-        test_dict[i]= {'question': question, 'translated_paths': sorted_translated_paths, 'reasoning_paths': sorted_reasoning_paths, 'path_distances': sorted_distances}
+        test_dict[i]= {'question': question,
+                        'translated_paths': sorted_translated_paths,
+                        'reasoning_paths': sorted_reasoning_paths,
+                        'path_distances': sorted_distances,
+                        'cand_relations': sample['relation_list'],
+                        'gt_relations': sorted({
+                                                rel
+                                                for path in sorted_reasoning_paths
+                                                for rel in path
+                                            })
+                                                        }
         test_dict_list.append(test_dict)
+
     with open(save_path + 'test_text_dict_list.pickle', 'wb') as f:
         pickle.dump(test_dict_list, f)
 
@@ -132,8 +225,8 @@ if __name__ == '__main__':
     from argparse import ArgumentParser
     
     parser = ArgumentParser()
-    parser.add_argument('-d', '--dataset', type=str, default='webqsp',
-                        choices=['webqsp', 'cwq'], help='Dataset name')
+    parser.add_argument('-d', '--dataset', type=str, default='toy',
+                        choices=['webqsp', 'cwq', 'toy', 'OntoOmicsKG_step2'], help='Dataset name')
     args = parser.parse_args()
     main(args)
     

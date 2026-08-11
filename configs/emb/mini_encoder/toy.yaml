@@ -1,0 +1,10 @@
+task: 'emb'
+
+env:
+  num_threads: 16
+  seed: 42
+
+entity_identifier_file: 'data_files/toy/entity_identifiers.txt'
+
+text_encoder:
+  name: 'sentence-transformers/all-MiniLM-L6-v2'

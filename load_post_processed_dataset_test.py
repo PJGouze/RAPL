@@ -1,3 +1,4 @@
+#load_post_processed_dataset_test.py
 import numpy as np
 import os
 import sys
@@ -9,7 +10,7 @@ import wandb
 
 from collections import defaultdict
 from torch.optim import Adam
-from torch_geometric.loader import DataLoader
+#from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
 from src.config.retriever import load_yaml
@@ -35,12 +36,15 @@ def show_zero_indices_path_label(data):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Process dataset name.')
-    parser.add_argument('--name', type=str, default='webqsp', help='Name of the dataset')
+    parser.add_argument('--name', type=str, default='toy', help='Name of the dataset')
     args = parser.parse_args()
     name = args.name
     print ('making dataset:',name)
-    dset = KGDataset(root=f'data/{name}/',split='val')
-    dset = KGDataset(root=f'data/{name}/',split='test')
+    dset = KGDataset(root=f'data_files/{name}/',split='val')
+    #dset = KGDataset(root=f'data_files/{name}/',split='test')
+    print('type : ', type(dset))
+    print('len : ',len(dset))
+    (dset.indices())
     print (dset[0])
 
     

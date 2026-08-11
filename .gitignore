@@ -1,0 +1,46 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Generated datasets and model artifacts
+data_files/
+hf_models/
+checkpoints/
+wandb/
+runs/
+smoke_runs/
+
+# Logs and Slurm outputs
+*.log
+slurm-*.out
+slurm-*.err
+
+# Local environment variables
+.env
+.env.*
+!.env.example
+
+# Temporary backup copies
+*_pre*.py
+*~
+*.bak
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+
+# Generated experiment outputs
+experiments/

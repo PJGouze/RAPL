@@ -51,7 +51,7 @@ def extract_latest_answer(response_text):
 
 
 
-def chat(args):
+def LLM_answering(args):
     """
     Main function that:
       1) Lists all sample text files in args.file_dir whose names match `sample_*.txt`.
@@ -164,7 +164,7 @@ if __name__ == '__main__':
     parser.add_argument('--file_dir', type=str, required=True, help='Directory containing sample_xxx.txt files.')
     args = parser.parse_args()
 
-    chat(args)
+    LLM_answering(args)
 
 
 

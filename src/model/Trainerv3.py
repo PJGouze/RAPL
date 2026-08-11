@@ -1,3 +1,4 @@
+#update: 10/08 12:49
 import torch
 import torch.nn as nn
 from torch_geometric.nn import GCNConv, GATConv, SGConv, GINConv
@@ -18,52 +19,61 @@ import time
 
 
 class Trainer(nn.Module):
-    def __init__(self, model_type='GCN', bidirectional=False, use_stop_mlp=True, num_mlp_layers=2,
-                 num_layers=3, num_heads=4, K=3, in_dims=3072, hidden_dims=512, out_dims=512,
-                 batch_norm=True, dropout=0.5, lr=1e-3, epochs=100, num_sampled_paths=10,
-                 max_depth=6, device=0, **args):
+    def __init__(self, model_type='GCN', bidirectional=False,
+                 use_stop_mlp=True, num_mlp_layers=2,
+                 num_layers=3, num_heads=4, K=3, in_dims=None,
+                 emb_size=384, hidden_dims=512, out_dims=512,
+                 batch_norm=True, dropout=0.5, lr=1e-3, epochs=100,
+                 num_sampled_paths=10, max_depth=6, device=0, **args):
         super().__init__()
         self.run = args.get('wandb', None)
         self.last_entity_cache = []
-        self.pathloss_train_after_epoch = args.get('pathloss_train_after_epoch', 0)
+        self.pathloss_train_after_epoch = args.get(
+            'pathloss_train_after_epoch', 0)
         self.model_type = model_type
         self.max_depth = max_depth
         self.bidirectional = bidirectional
         self.use_stop_mlp = use_stop_mlp
         self.num_layers = num_layers
         self.batch_norm = batch_norm
+        self.emb_size = emb_size
+        self.hidden_dims = hidden_dims
         self.out_dims = out_dims
+        self.dropout = dropout
         self.epochs = epochs
         self.num_sampled_paths = num_sampled_paths
         self.epoch_cuda_memories = []  # To store memory in MB
         self.epoch_runtimes = []       # To store runtime in seconds
-        
+        if in_dims is None:
+            in_dims = 3 * emb_size
+        self.in_dims = in_dims
         # Device setup
         if isinstance(device, int):
-            self.device = torch.device(f'cuda:{device}' if torch.cuda.is_available() else 'cpu')
+            self.device = torch.device(
+                f'cuda:{device}' if torch.cuda.is_available() else 'cpu')
         else:
             self.device = torch.device(device)
 
         # MLP for question embedding
         self.q_mlp = nn.Sequential(
-            nn.Linear(1024, 512),
+            nn.Linear(self.emb_size, self.hidden_dims),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(512, 512)
+            nn.Dropout(self.dropout),
+            nn.Linear(hidden_dims, out_dims)
         )
 
         # MLP for topic triple embedding
         self.r_mlp = nn.Sequential(
-            nn.Linear(1024, 512),
+            nn.Linear(self.emb_size, hidden_dims),
             nn.ReLU(),
-            nn.Linear(512, 512)
+            nn.Linear(hidden_dims, out_dims)
         )
 
         if use_stop_mlp:
             self.stop_mlp = nn.Sequential(
-                nn.Linear(1024, hidden_dims),
+                nn.Linear(self.emb_size, self.hidden_dims),
                 nn.ReLU(),
-                nn.Dropout(dropout),
+                nn.Dropout(self.dropout),
                 nn.Linear(hidden_dims, out_dims)
             )
 
@@ -75,13 +85,13 @@ class Trainer(nn.Module):
             self.convs = nn.ModuleList()
             self.bns = nn.ModuleList() if batch_norm else None
 
-            hidden = hidden_dims
+            hidden = self.hidden_dims
             for layer in range(num_layers):
                 in_dim = in_dims if layer == 0 else hidden
                 out_dim = out_dims if layer == num_layers - 1 else hidden
 
                 if model_type == 'GCN':
-                    conv = GCNConv(in_dim, out_dim, add_self_loops=False)
+                    conv = GCNConv(in_dim, out_dim, add_self_loops=True)
                 elif model_type == 'GAT':
                     conv = GATConv(in_dim, out_dim, heads=num_heads, add_self_loops=False)
                 elif model_type == 'SGConv':
@@ -108,7 +118,7 @@ class Trainer(nn.Module):
                     out_dim = out_dims if layer == num_layers - 1 else hidden
 
                     if model_type == 'GCN':
-                        conv_b = GCNConv(in_dim, out_dim, add_self_loops=False)
+                        conv_b = GCNConv(in_dim, out_dim, add_self_loops=True)
                     elif model_type == 'GAT':
                         conv_b = GATConv(in_dim, out_dim, heads=num_heads, add_self_loops=False)
                     elif model_type == 'SGConv':
@@ -160,6 +170,11 @@ class Trainer(nn.Module):
 
         # Optimizer
         self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+        self.optimizer_step_count = 0
+        self.gradient_audit = []
+        self.validation_grad_enabled_observations = []
+        self.last_train_step_path_statistics = None
+        self.last_evaluation_path_statistics = None
 
         # Move to device
         self.to(self.device)
@@ -187,6 +202,223 @@ class Trainer(nn.Module):
                 hb = torch.relu(hb)
         return h + hb
 
+    def _path_steps_from_column(self, column_vals):
+        """Map path-step ordinals to nodes and reject malformed supervision."""
+        if column_vals.ndim != 1:
+            raise ValueError(
+                f"path_label column must be 1D, got shape={tuple(column_vals.shape)}."
+            )
+        invalid_negative = column_vals[column_vals < -1]
+        if invalid_negative.numel() > 0:
+            raise ValueError(
+                "path_label values must be -1 (ignored) or non-negative step "
+                f"ordinals; found {torch.unique(invalid_negative).tolist()}."
+            )
+        step_to_node = {}
+        for node_index, step_tensor in enumerate(column_vals):
+            step = int(step_tensor.item())
+            if step == -1:
+                continue
+            if step in step_to_node:
+                raise ValueError(
+                    f"path_label step {step} occurs more than once in one path column."
+                )
+            step_to_node[step] = node_index
+        if not step_to_node:
+            return {}
+        steps = sorted(step_to_node)
+        expected_steps = list(range(steps[-1] + 1))
+        if steps != expected_steps:
+            raise ValueError(
+                f"path_label steps must be contiguous from 0; found {steps}."
+            )
+        if len(steps) > self.max_depth:
+            raise ValueError(
+                f"path_label has {len(steps)} supervised steps, exceeding "
+                f"trainer max_depth={self.max_depth}."
+            )
+        return step_to_node
+
+    @staticmethod
+    def _path_cross_entropy(logits, target_index, context):
+        """Compute one real path decision loss with an explicit range check."""
+        if logits.ndim != 1:
+            raise ValueError(
+                f"Path logits must be 1D ({context}); got shape={tuple(logits.shape)}."
+            )
+        if target_index < 0 or target_index >= logits.numel():
+            raise ValueError(
+                f"Path target index out of range ({context}): target={target_index}, "
+                f"valid_range=[0, {logits.numel() - 1}]."
+            )
+        target = torch.tensor([target_index], device=logits.device)
+        return F.cross_entropy(logits.unsqueeze(0), target)
+
+    @staticmethod
+    def _new_path_statistics():
+        return {
+            "supervised_path_count": 0,
+            "transition_decision_count": 0,
+            "stop_decision_count": 0,
+            "transition_loss_sum": 0.0,
+            "stop_loss_sum": 0.0,
+            "batches_with_path_supervision": 0,
+            "batches_without_path_supervision": 0,
+            "logits_dtypes": set(),
+            "loss_dtypes": set(),
+        }
+
+    @staticmethod
+    def _record_path_decision(statistics, decision_type, logits, loss):
+        if decision_type not in {"transition", "stop"}:
+            raise ValueError(f"Unsupported path decision type: {decision_type!r}.")
+        statistics[f"{decision_type}_decision_count"] += 1
+        statistics[f"{decision_type}_loss_sum"] += float(loss.detach().item())
+        statistics["logits_dtypes"].add(str(logits.dtype).removeprefix("torch."))
+        statistics["loss_dtypes"].add(str(loss.dtype).removeprefix("torch."))
+
+    @classmethod
+    def _merge_path_statistics(cls, statistics_items):
+        merged = cls._new_path_statistics()
+        for statistics in statistics_items:
+            for key in (
+                "supervised_path_count",
+                "transition_decision_count",
+                "stop_decision_count",
+                "transition_loss_sum",
+                "stop_loss_sum",
+                "batches_with_path_supervision",
+                "batches_without_path_supervision",
+            ):
+                merged[key] += statistics[key]
+            merged["logits_dtypes"].update(statistics["logits_dtypes"])
+            merged["loss_dtypes"].update(statistics["loss_dtypes"])
+        return merged
+
+    @staticmethod
+    def _summarize_path_statistics(statistics):
+        transition_count = statistics["transition_decision_count"]
+        stop_count = statistics["stop_decision_count"]
+        decision_count = transition_count + stop_count
+        total_loss = (
+            statistics["transition_loss_sum"] + statistics["stop_loss_sum"]
+        )
+        return {
+            "supervised_path_count": statistics["supervised_path_count"],
+            "transition_decision_count": transition_count,
+            "stop_decision_count": stop_count,
+            "path_decision_count": decision_count,
+            "batches_with_path_supervision": statistics[
+                "batches_with_path_supervision"
+            ],
+            "batches_without_path_supervision": statistics[
+                "batches_without_path_supervision"
+            ],
+            "mean_path_loss": total_loss / decision_count if decision_count else None,
+            "mean_transition_loss": (
+                statistics["transition_loss_sum"] / transition_count
+                if transition_count else None
+            ),
+            "mean_stop_loss": (
+                statistics["stop_loss_sum"] / stop_count if stop_count else None
+            ),
+            "logits_dtypes": sorted(statistics["logits_dtypes"]),
+            "loss_dtypes": sorted(statistics["loss_dtypes"]),
+        }
+
+    @staticmethod
+    def _finish_path_batch(statistics):
+        decision_count = (
+            statistics["transition_decision_count"]
+            + statistics["stop_decision_count"]
+        )
+        key = (
+            "batches_with_path_supervision"
+            if decision_count
+            else "batches_without_path_supervision"
+        )
+        statistics[key] += 1
+
+    def _path_loss_for_column(
+        self,
+        column_vals,
+        node_emb,
+        question_emb,
+        one_hop_neighbors,
+        stop_emb,
+        context_label,
+        node_offset=0,
+    ):
+        """Compute all transition and STOP decisions for one supervised path."""
+        statistics = self._new_path_statistics()
+        local_step_to_node = self._path_steps_from_column(column_vals)
+        if 0 not in local_step_to_node:
+            return torch.tensor(0.0, device=node_emb.device), statistics
+
+        statistics["supervised_path_count"] = 1
+        step_to_node = {
+            step: node_offset + node_index
+            for step, node_index in local_step_to_node.items()
+        }
+        path_steps = sorted(step_to_node)
+        current_node = step_to_node[0]
+        context = question_emb + node_emb[current_node]
+        path_loss = torch.tensor(0.0, device=node_emb.device)
+
+        for step in path_steps[1:]:
+            next_node = step_to_node[step]
+            neighbors = one_hop_neighbors[current_node - node_offset]
+            if next_node not in neighbors:
+                raise ValueError(
+                    f"Supervised next node {next_node} is not a neighbor of "
+                    f"node {current_node} ({context_label}, step={step})."
+                )
+            candidate_embs = torch.cat([node_emb[neighbors], stop_emb], dim=0)
+            logits = torch.matmul(candidate_embs, context)
+            loss = self._path_cross_entropy(
+                logits,
+                neighbors.index(next_node),
+                context=f"{context_label}, transition step={step}",
+            )
+            path_loss += loss
+            self._record_path_decision(statistics, "transition", logits, loss)
+            context = context + node_emb[next_node]
+            current_node = next_node
+
+        neighbors = one_hop_neighbors[current_node - node_offset]
+        candidate_embs = torch.cat([node_emb[neighbors], stop_emb], dim=0)
+        logits = torch.matmul(candidate_embs, context)
+        loss = self._path_cross_entropy(
+            logits,
+            len(neighbors),
+            context=f"{context_label}, STOP",
+        )
+        path_loss += loss
+        self._record_path_decision(statistics, "stop", logits, loss)
+        return path_loss, statistics
+
+    @staticmethod
+    def _topic_binary_loss(pos_logit, neg_logits):
+        """Compute the real topic positive/negative binary classification loss."""
+        positive_targets = torch.ones(1, device=pos_logit.device)
+        negative_targets = torch.zeros(neg_logits.numel(), device=neg_logits.device)
+        positive_loss = F.binary_cross_entropy_with_logits(
+            pos_logit.reshape(1), positive_targets
+        )
+        negative_loss = F.binary_cross_entropy_with_logits(
+            neg_logits.reshape(-1), negative_targets
+        )
+        return positive_loss + negative_loss, positive_targets, negative_targets
+
+    def _checkpoint_payload(self, epoch, metrics):
+        return {
+            "epoch": epoch,
+            "model_state_dict": self.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "metrics": metrics,
+        }
+
+
     def train_step(self, batch, scaler, pathtrainingstart=False):
         """
         Handles a batch of graphs, with `batch` being a `DataBatch` object from PyG.
@@ -206,17 +438,25 @@ class Trainer(nn.Module):
         """
         device = self.device
         batch = batch.to(device)
+        neighbors_list = batch.one_hop_neighbors
+
+        # PyG wraps Python objects in an extra list when batching.
+        if len(neighbors_list) == 1 and isinstance(neighbors_list[0], list):
+            neighbors_list = neighbors_list[0]
 
         total_nodes = batch.x.size(0)
         batch_size = batch.ptr.size(0) - 1
 
-        with torch.amp.autocast(device_type='cuda'):
+        with torch.amp.autocast(
+            device_type=self.device.type,
+            enabled=self.device.type == "cuda",
+        ):
             # For topic-entity
             if self.model_type != "MLP":
                 node_emb = self._gnn_forward(batch.x, batch.edge_index)
             else:
                 node_emb = self.mlp(batch.x)
-            topic_triplet_emb = self.r_mlp(batch.x[:, 1024:2048])
+            topic_triplet_emb = self.r_mlp(batch.x[:, self.emb_size:2*self.emb_size])
             topic_triplet_emb = topic_triplet_emb + node_emb
 
             # Process question embedding
@@ -228,7 +468,7 @@ class Trainer(nn.Module):
             topic_loss = torch.tensor(0.0, device=device)
             path_loss = torch.tensor(0.0, device=device)
             topic_count = 0
-            path_count = 0
+            path_statistics = self._new_path_statistics()
 
             # -------------------
             # Process Each Graph
@@ -248,6 +488,26 @@ class Trainer(nn.Module):
                 one_hop_neighbors_adjusted = [
                     [n + graph_start for n in neighbors] for neighbors in one_hop_neighbors
                 ]
+                ######################################################################################
+                #DEBUGGING 04/08 ---------------------------------------------------------------------
+                ######################################################################################
+
+                # print(f"\nGraph {graph_idx}")
+                # print("topic_label unique:", torch.unique(topic_label))
+                # print("topic_candidates unique:", torch.unique(topic_candidates))
+                # print("num positives:", (topic_label == 1).sum().item())
+                # print("num candidates:", (topic_candidates == 1).sum().item())
+
+                # print("path_label unique:", torch.unique(path_label))
+                ######################################################################################
+                #DEBUGGING 04/08 ---------------------------------------------------------------------
+                ######################################################################################
+                valid_columns = []
+                for c in range(path_label.size(1)):
+                    if torch.any(path_label[:, c] == 0):
+                        valid_columns.append(c)
+
+                print("valid_columns:", valid_columns)
 
                 # ------------------------------------------------------------------
                 # (1) Topic-Entity Loss with Negative Sampling
@@ -293,15 +553,9 @@ class Trainer(nn.Module):
                         # We can do standard binary cross-entropy for positive + negative
                         # Positive label = 1, Negative label = 0
                         # => total topic loss
-                        pos_loss = F.binary_cross_entropy_with_logits(
-                            pos_logit.unsqueeze(0),  # (1,)
-                            torch.ones(1, device=device)
+                        topic_loss_sample, _, _ = self._topic_binary_loss(
+                            pos_logit, neg_logit
                         )
-                        neg_loss = F.binary_cross_entropy_with_logits(
-                            neg_logit,  # (K,)
-                            torch.zeros(len(neg_logit), device=device)
-                        )
-                        topic_loss_sample = pos_loss + neg_loss
 
                         topic_loss += topic_loss_sample
                         topic_count += 1
@@ -323,78 +577,85 @@ class Trainer(nn.Module):
 
                     chosen_col = random.choice(valid_columns)
                     column_vals = path_label[:, chosen_col]
-                    step_to_node = {}
-                    for i_node in range(num_nodes_in_graph):
-                        step = column_vals[i_node].item()
-                        if step >= 0:
-                            step_to_node[step] = graph_start + i_node
-
-                    # Must have a step=0 node
-                    if 0 not in step_to_node:
-                        continue
-
-                    # Ground-truth path steps
-                    path_steps = sorted(step_to_node.keys())
-                    current_node = step_to_node[path_steps[0]]
-                    context = q_emb[graph_idx] + node_emb[current_node]
-
                     stop_emb = self.stop_emb.unsqueeze(0)  # shape [1, out_dims]
                     if self.use_stop_mlp:
                         stop_emb = stop_emb + cond_stop_emb[graph_idx].unsqueeze(0)
-
-                    # If path length < 2 => immediate STOP
-                    if len(path_steps) < 2:
-                        neighbors = one_hop_neighbors_adjusted[current_node - graph_start]
-                        cand_embs = torch.cat([node_emb[neighbors], stop_emb], dim=0)
-                        logits_stop = torch.matmul(cand_embs, context)
-                        target_idx_stop = torch.tensor([len(neighbors)], device=device)
-                        path_loss_sample = F.cross_entropy(logits_stop.unsqueeze(0), target_idx_stop)
-                        path_loss += path_loss_sample
-                        path_count += 1
-                    else:
-                        # Autoregressive path
-                        for step_i in path_steps[1:]:
-                            gt_next_node = step_to_node[step_i]
-                            neighbors = one_hop_neighbors_adjusted[current_node - graph_start]
-                            if gt_next_node not in neighbors:
-                                continue
-                            # Candidate embeddings: neighbor + stop
-                            cand_embs = torch.cat([node_emb[neighbors], stop_emb], dim=0)
-                            logits = torch.matmul(cand_embs, context)
-                            target_idx = torch.tensor([neighbors.index(gt_next_node)], device=device)
-                            path_loss_sample = F.cross_entropy(logits.unsqueeze(0), target_idx)
-                            path_loss += path_loss_sample
-                            path_count += 1
-
-                            # Update context
-                            context = context + node_emb[gt_next_node]
-                            current_node = gt_next_node
-
-                        # Finally, STOP
-                        neighbors = one_hop_neighbors_adjusted[current_node - graph_start]
-                        cand_embs = torch.cat([node_emb[neighbors], stop_emb], dim=0)
-                        logits_stop = torch.matmul(cand_embs, context)
-                        target_idx_stop = torch.tensor([len(neighbors)], device=device)
-                        path_loss_sample = F.cross_entropy(
-                            logits_stop.unsqueeze(0), target_idx_stop
+                    path_loss_sample, sample_statistics = (
+                        self._path_loss_for_column(
+                            column_vals=column_vals,
+                            node_emb=node_emb,
+                            question_emb=q_emb[graph_idx],
+                            one_hop_neighbors=one_hop_neighbors_adjusted,
+                            stop_emb=stop_emb,
+                            context_label=f"training batch graph={graph_idx}",
+                            node_offset=graph_start,
                         )
-                        path_loss += path_loss_sample
-                        path_count += 1
+                    )
+                    path_loss += path_loss_sample
+                    path_statistics = self._merge_path_statistics(
+                        [path_statistics, sample_statistics]
+                    )
 
         # Normalize losses
         if topic_count > 0:
             topic_loss /= topic_count
+        path_count = (
+            path_statistics["transition_decision_count"]
+            + path_statistics["stop_decision_count"]
+        )
         if path_count > 0:
             path_loss /= path_count
+        self._finish_path_batch(path_statistics)
+        self.last_train_step_path_statistics = path_statistics
         total_loss = topic_loss + path_loss
+        if not torch.isfinite(total_loss):
+            raise FloatingPointError(
+                f"Non-finite total loss: topic={topic_loss.item()}, "
+                f"path={path_loss.item()}."
+            )
+        print(
+        f"topic_count={topic_count}, "
+        f"path_count={path_count}, "
+        f"requires_grad={total_loss.requires_grad}"
+        )
 
         # Backprop
         self.optimizer.zero_grad()
         scaler.scale(total_loss).backward()
+        scaler.unscale_(self.optimizer)
+        gradients = [
+            parameter.grad
+            for parameter in self.parameters()
+            if parameter.grad is not None
+        ]
+        nonfinite_gradients = sum(
+            not torch.isfinite(gradient).all().item() for gradient in gradients
+        )
+        if nonfinite_gradients:
+            raise FloatingPointError(
+                f"Found {nonfinite_gradients} parameter gradients with non-finite values."
+            )
+        self.gradient_audit.append({
+            "parameters_with_gradients": len(gradients),
+            "parameters_with_nonzero_gradients": sum(
+                torch.any(gradient != 0).item() for gradient in gradients
+            ),
+            "parameters_with_nonfinite_gradients": nonfinite_gradients,
+        })
         scaler.step(self.optimizer)
         scaler.update()
+        self.optimizer_step_count += 1
+        nonfinite_parameters = sum(
+            not torch.isfinite(parameter).all().item()
+            for parameter in self.parameters()
+        )
+        if nonfinite_parameters:
+            raise FloatingPointError(
+                f"Found {nonfinite_parameters} trainable parameters with non-finite values."
+            )
 
         return total_loss.item(), topic_loss.item(), path_loss.item()
+
 
     def fit(
         self,
@@ -404,8 +665,8 @@ class Trainer(nn.Module):
         pathtrainingstart: bool = True,
     ):
         """
-        Train the model on a *single* dataset and (optionally) evaluate on a single
-        validation set each epoch.
+        Train the model on a *single* dataset and (optionally)
+        evaluate on a single validation set each epoch.
 
         The function:
         • Performs mixed-precision training (GradScaler).
@@ -424,13 +685,17 @@ class Trainer(nn.Module):
         save_dir : str, optional
             Directory for logs and checkpoints.  Created if it does not exist.
         pathtrainingstart : bool, default = False
-            Whether to include path loss from epoch 0.  (If you switch this flag
-            mid-training, pass the desired value here.)
+            Whether to include path loss from epoch 0.
+            (If you switch this flagmid-training, pass the desired value here.)
         """
-        scaler = torch.cuda.amp.GradScaler()
+        scaler = torch.amp.GradScaler(
+            self.device.type,
+            enabled=self.device.type == "cuda",
+        )
 
         # track top-3 validation F1
         best_f1_scores = []
+        history = []
 
         # prepare directories / offline logs
         if save_dir is not None:
@@ -439,9 +704,26 @@ class Trainer(nn.Module):
             os.makedirs(save_dir_val, exist_ok=True)
             log_file = os.path.join(save_dir, "oom_log.txt")
             log_arrays = {
-                'TrainTopicLoss': [], 'TrainPathLoss': [], 'TrainTotalLoss': [],
+                'TrainTopicLoss': [], 'TrainPathLoss': [],
+                'TrainTotalLoss': [],
                 'ValTopicLoss':   [], 'ValPathLoss':   [],
                 'Precision':      [], 'Recall':        [], 'F1': []
+                , 'ValTotalLoss': [], 'EpochElapsedSeconds': [],
+                'TrainBatchCount': [],
+                'TrainSupervisedPathCount': [],
+                'TrainTransitionDecisionCount': [],
+                'TrainStopDecisionCount': [],
+                'TrainBatchesWithPathSupervision': [],
+                'TrainBatchesWithoutPathSupervision': [],
+                'TrainMeanTransitionLoss': [],
+                'TrainMeanStopLoss': [],
+                'ValSupervisedPathCount': [],
+                'ValTransitionDecisionCount': [],
+                'ValStopDecisionCount': [],
+                'ValBatchesWithPathSupervision': [],
+                'ValBatchesWithoutPathSupervision': [],
+                'ValMeanTransitionLoss': [],
+                'ValMeanStopLoss': [],
             }
         else:
             log_file = "oom_log.txt"
@@ -452,12 +734,15 @@ class Trainer(nn.Module):
             pathtrainingstart = True
 
             start_time = time.time()
-            torch.cuda.reset_peak_memory_stats()
+            if self.device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(self.device)
             self.train()
+            train_mode_at_start = self.training
 
             # accumulators
-            tot_loss = tot_topic = tot_path = 0.0
+            tot_loss = tot_topic = 0.0
             batch_cnt = 0
+            train_path_statistics = []
 
             ################################################
             # ----------  Training loop  -------------------
@@ -469,8 +754,10 @@ class Trainer(nn.Module):
                     )
                     tot_loss  += loss
                     tot_topic += topic_loss
-                    tot_path  += path_loss
                     batch_cnt += 1
+                    train_path_statistics.append(
+                        self.last_train_step_path_statistics
+                    )
 
                     print(f"[Epoch {epoch} | Batch {batch_cnt}] "
                         f"TopicLoss: {topic_loss:.4f}, "
@@ -482,7 +769,8 @@ class Trainer(nn.Module):
                     torch.cuda.empty_cache()
                     if "memory" in str(e).lower():
                         with open(log_file, "a") as f:
-                            f.write(f"[OOM] Epoch {epoch}, Batch {batch_idx}\n"
+                            f.write(
+                                f"[OOM] Epoch {epoch}, Batch {batch_idx}\n"
                                     f"{traceback.format_exc()}\n"
                                     "-------------------------\n")
                     continue  # skip the failed batch
@@ -490,12 +778,20 @@ class Trainer(nn.Module):
             # epoch-level statistics
             avg_loss       = tot_loss  / max(1, batch_cnt)
             avg_topic_loss = tot_topic / max(1, batch_cnt)
-            avg_path_loss  = tot_path  / max(1, batch_cnt)
+            train_path_summary = self._summarize_path_statistics(
+                self._merge_path_statistics(train_path_statistics)
+            )
+            avg_path_loss = train_path_summary["mean_path_loss"]
+            if batch_cnt == 0:
+                raise RuntimeError(f"Epoch {epoch} completed without a successful batch.")
 
+            path_loss_text = (
+                f"{avg_path_loss:.4f}" if avg_path_loss is not None else "unavailable"
+            )
             print(f"Epoch {epoch} summary — "
                 f"AvgLoss: {avg_loss:.4f}, "
                 f"AvgTopicLoss: {avg_topic_loss:.4f}, "
-                f"AvgPathLoss: {avg_path_loss:.4f} ")
+                f"AvgPathLoss: {path_loss_text} ")
 
             ################################################
             # ----------  Offline / wandb logging ----------
@@ -508,13 +804,15 @@ class Trainer(nn.Module):
                 })
             elif log_arrays is not None:        # offline
                 log_arrays['TrainTopicLoss'].append(avg_topic_loss)
-                log_arrays['TrainPathLoss'].append(avg_path_loss)
+                log_arrays['TrainPathLoss'].append(
+                    avg_path_loss if avg_path_loss is not None else np.nan
+                )
                 log_arrays['TrainTotalLoss'].append(avg_loss)
 
             ################################################
             # ----------  Validation (optional) ------------
             ################################################
-            if val_dataloader is not None and epoch > 5:
+            if val_dataloader is not None:
                 val_topic, val_path, prec, rec = self.evaluate(
                     val_dataloader,
                     eval_loss=True,
@@ -525,8 +823,11 @@ class Trainer(nn.Module):
                 )
 
                 if pathtrainingstart:
+                    val_path_text = (
+                        f"{val_path:.4f}" if val_path is not None else "unavailable"
+                    )
                     print(f"[Validation] TopicLoss: {val_topic:.4f}, "
-                        f"PathLoss: {val_path:.4f}, "
+                        f"PathLoss: {val_path_text}, "
                         f"Precision: {prec:.4f}, Recall: {rec:.4f}")
                 else:
                     print(f"[Validation] TopicLoss: {val_topic:.4f}")
@@ -537,6 +838,16 @@ class Trainer(nn.Module):
                     if prec + rec > 0:
                         f1 = 2 * prec * rec / (prec + rec)
                     print(f"[Validation] F1: {f1:.4f}")
+                val_total = val_topic + (val_path if val_path is not None else 0.0)
+                finite_values = [val_topic, val_path, val_total, prec, rec, f1]
+                if not all(
+                    torch.isfinite(torch.as_tensor(value))
+                    for value in finite_values if value is not None
+                ):
+                    raise FloatingPointError(
+                        f"Non-finite validation metric at epoch {epoch}: "
+                        f"{finite_values}."
+                    )
 
                 # wandb / offline log
                 if self.run is not None:
@@ -552,10 +863,78 @@ class Trainer(nn.Module):
                 elif log_arrays is not None:
                     log_arrays['ValTopicLoss'].append(val_topic)
                     if pathtrainingstart:
-                        log_arrays['ValPathLoss'].append(val_path)
+                        log_arrays['ValPathLoss'].append(
+                            val_path if val_path is not None else np.nan
+                        )
                         log_arrays['Precision'].append(prec)
                         log_arrays['Recall'].append(rec)
                         log_arrays['F1'].append(f1)
+
+            elapsed_seconds = time.time() - start_time
+            validation_path_summary = self.last_evaluation_path_statistics
+            epoch_metrics = {
+                "epoch": epoch,
+                "train_batches": batch_cnt,
+                "train_path_loss": avg_path_loss,
+                "train_topic_loss": avg_topic_loss,
+                "train_total_loss": avg_loss,
+                "validation_path_loss": (
+                    float(val_path) if val_path is not None else None
+                ),
+                "validation_topic_loss": float(val_topic),
+                "validation_total_loss": float(val_total),
+                "precision": float(prec),
+                "recall": float(rec),
+                "f1": float(f1),
+                "elapsed_seconds": elapsed_seconds,
+                "train_mode_at_epoch_start": train_mode_at_start,
+                "validation_grad_enabled": self.validation_grad_enabled_observations[-1],
+            }
+            for prefix, summary in (
+                ("train", train_path_summary),
+                ("validation", validation_path_summary),
+            ):
+                for key in (
+                    "supervised_path_count",
+                    "transition_decision_count",
+                    "stop_decision_count",
+                    "path_decision_count",
+                    "batches_with_path_supervision",
+                    "batches_without_path_supervision",
+                    "mean_transition_loss",
+                    "mean_stop_loss",
+                    "logits_dtypes",
+                    "loss_dtypes",
+                ):
+                    epoch_metrics[f"{prefix}_{key}"] = summary[key]
+            history.append(epoch_metrics)
+            if log_arrays is not None:
+                log_arrays['ValTotalLoss'].append(float(val_total))
+                log_arrays['EpochElapsedSeconds'].append(elapsed_seconds)
+                log_arrays['TrainBatchCount'].append(batch_cnt)
+                for array_prefix, summary in (
+                    ("Train", train_path_summary),
+                    ("Val", validation_path_summary),
+                ):
+                    for suffix, key in (
+                        ("SupervisedPathCount", "supervised_path_count"),
+                        ("TransitionDecisionCount", "transition_decision_count"),
+                        ("StopDecisionCount", "stop_decision_count"),
+                        (
+                            "BatchesWithPathSupervision",
+                            "batches_with_path_supervision",
+                        ),
+                        (
+                            "BatchesWithoutPathSupervision",
+                            "batches_without_path_supervision",
+                        ),
+                        ("MeanTransitionLoss", "mean_transition_loss"),
+                        ("MeanStopLoss", "mean_stop_loss"),
+                    ):
+                        value = summary[key]
+                        log_arrays[f"{array_prefix}{suffix}"].append(
+                            value if value is not None else np.nan
+                        )
 
                 # checkpoint if within top-3 F1
                 if pathtrainingstart and f1 > 0:
@@ -570,7 +949,10 @@ class Trainer(nn.Module):
                                 save_dir_val,
                                 f"model_epoch_{epoch}_f1_{f1:.4f}.pt"
                             )
-                            torch.save(self.state_dict(), ckpt_path)
+                            torch.save(
+                                self._checkpoint_payload(epoch, epoch_metrics),
+                                ckpt_path,
+                            )
                             print(f"[Validation] Checkpoint saved → {ckpt_path}")
 
             ################################################
@@ -590,15 +972,20 @@ class Trainer(nn.Module):
             ################################################
             if save_dir is not None:
                 ckpt_name = f"epoch_{epoch}_trainLoss_{avg_loss:.4f}.pt"
-                torch.save(self.state_dict(), os.path.join(save_dir, ckpt_name))
+                torch.save(
+                    self._checkpoint_payload(epoch, epoch_metrics),
+                    os.path.join(save_dir, ckpt_name),
+                )
                 print(f"[Epoch {epoch}] Full model saved → {ckpt_name}")
 
         print("Training complete.")
         print("Peak memory (first 5 epochs):", self.epoch_cuda_memories[:5])
         print("Runtime     (first 5 epochs):", self.epoch_runtimes[:5])
-
-
-
+        return {
+            "epochs": history,
+            "optimizer_step_count": self.optimizer_step_count,
+            "gradient_audit": self.gradient_audit,
+        }
 
 
     def evaluate(self, 
@@ -617,7 +1004,7 @@ class Trainer(nn.Module):
         device = self.device
 
         total_topic_loss = 0.0
-        total_path_loss = 0.0
+        evaluation_path_statistics = self._new_path_statistics()
 
         # For recall
         total_correct = 0
@@ -639,14 +1026,22 @@ class Trainer(nn.Module):
         N_batch = len(dataloader)
 
         with torch.no_grad():
-            with torch.amp.autocast(device_type='cuda'):
+            self.validation_grad_enabled_observations.append(torch.is_grad_enabled())
+            with torch.amp.autocast(
+                device_type=self.device.type,
+                enabled=self.device.type == "cuda",
+            ):
                 for batch_idx, batch in enumerate(tqdm(dataloader)):
                     # Because batch_size=1, 'batch' is a single graph
+                    # print(batch.num_graphs)
+                    # print(batch.ptr)
+                    # print(batch.num_nodes)
+                    # print(len(batch.one_hop_neighbors))
                     batch = batch.to(device)
 
                     # Evaluate node embeddings (for topic loss)
                     node_emb = self._gnn_forward(batch.x, batch.edge_index)
-                    topic_triplet_emb = self.r_mlp(batch.x[:, 1024:2048]) + node_emb
+                    topic_triplet_emb = self.r_mlp(batch.x[:, self.emb_size:2*self.emb_size]) + node_emb
 
                     # Process question embedding
                     q_ = batch.q_emb.to(device)
@@ -657,13 +1052,18 @@ class Trainer(nn.Module):
                     # Compute losses if requested
                     if eval_loss:
                         batch_topic_loss = 0.0
-                        batch_path_loss = 0.0
                         topic_count = 0
-                        path_count = 0
+                        batch_path_statistics = self._new_path_statistics()
 
                         # (1) Topic Loss
                         topic_candidates = batch.topic_candidates.view(-1)
                         topic_labels = batch.topic_labels.view(-1)
+                        print(
+                            "topic_label unique:",
+                            torch.unique(topic_labels),
+                            "sum:",
+                            topic_labels.sum()
+                        )
                         pos_indices_local = (topic_labels == 1).nonzero(as_tuple=True)[0]
                         neg_indices_local = ((topic_candidates == 1) & (topic_labels == 0)).nonzero(as_tuple=True)[0]
 
@@ -681,15 +1081,9 @@ class Trainer(nn.Module):
                                 pos_logit = torch.dot(pos_emb, q_[0])
                                 neg_logit = torch.matmul(neg_embs, q_[0])
 
-                                pos_loss = F.binary_cross_entropy_with_logits(
-                                    pos_logit.unsqueeze(0),
-                                    torch.ones(1, device=device)
+                                topic_loss_sample, _, _ = self._topic_binary_loss(
+                                    pos_logit, neg_logit
                                 )
-                                neg_loss = F.binary_cross_entropy_with_logits(
-                                    neg_logit,
-                                    torch.zeros(len(neg_logit), device=device)
-                                )
-                                topic_loss_sample = pos_loss + neg_loss
                                 batch_topic_loss += topic_loss_sample
                                 topic_count += 1
 
@@ -703,67 +1097,35 @@ class Trainer(nn.Module):
                             ]
                             for ccol in valid_columns:
                                 col_vals = path_label[:, ccol]
-                                stn = {
-                                    col_vals[i].item(): i
-                                    for i in range(node_count) if col_vals[i] >= 0
-                                }
-                                if 0 not in stn:
-                                    continue
-                                path_steps = sorted(stn.keys())
-                                current_node = stn[path_steps[0]]
-                                context = q_[0] + node_emb[current_node]
-
                                 stop_emb_ = self.stop_emb.unsqueeze(0)
                                 if self.use_stop_mlp:
                                     stop_emb_ = stop_emb_ + cond_stop_emb[0].unsqueeze(0)
 
-                                if len(path_steps) < 2:
-                                    neighbors = batch.one_hop_neighbors[current_node]
-                                    c_embs = torch.cat([node_emb[neighbors], stop_emb_], dim=0)
-                                    logits_stop = torch.matmul(c_embs, context)
-                                    target_idx_stop = torch.tensor([len(neighbors)], device=device)
-                                    path_loss_sample = F.cross_entropy(
-                                        logits_stop.unsqueeze(0), target_idx_stop
-                                    )
-                                    batch_path_loss += path_loss_sample
-                                    path_count += 1
-                                else:
-                                    for step_i in path_steps[1:]:
-                                        gt_next_node = stn[step_i]
-                                        neighbors = batch.one_hop_neighbors[current_node]
-                                        if gt_next_node not in neighbors:
-                                            continue
-                                        c_embs = torch.cat([node_emb[neighbors], stop_emb_], dim=0)
-                                        logits_ = torch.matmul(c_embs, context)
-                                        target_idx_ = torch.tensor([neighbors.index(gt_next_node)], device=device)
-                                        path_loss_sample = F.cross_entropy(
-                                            logits_.unsqueeze(0), target_idx_
-                                        )
-                                        batch_path_loss += path_loss_sample
-                                        path_count += 1
-                                        context = context + node_emb[gt_next_node]
-                                        current_node = gt_next_node
-
-                                    # final STOP
-                                    neighbors = batch.one_hop_neighbors[current_node]
-                                    c_embs = torch.cat([node_emb[neighbors], stop_emb_], dim=0)
-                                    logits_stop = torch.matmul(c_embs, context)
-                                    target_idx_stop = torch.tensor([len(neighbors)], device=device)
-                                    path_loss_sample = F.cross_entropy(
-                                        logits_stop.unsqueeze(0), target_idx_stop
-                                    )
-                                    batch_path_loss += path_loss_sample
-                                    path_count += 1
+                                neighbors_list = batch.one_hop_neighbors
+                                if isinstance(neighbors_list[0], list):
+                                    neighbors_list = neighbors_list[0]
+                                _, sample_statistics = self._path_loss_for_column(
+                                    column_vals=col_vals,
+                                    node_emb=node_emb,
+                                    question_emb=q_[0],
+                                    one_hop_neighbors=neighbors_list,
+                                    stop_emb=stop_emb_,
+                                    context_label=f"validation graph={batch_idx}",
+                                )
+                                batch_path_statistics = self._merge_path_statistics(
+                                    [batch_path_statistics, sample_statistics]
+                                )
 
                         if topic_count > 0:
                             batch_topic_loss /= topic_count
-                        if path_count > 0:
-                            batch_path_loss /= path_count
                         total_topic_loss += batch_topic_loss
-                        total_path_loss += batch_path_loss
+                        self._finish_path_batch(batch_path_statistics)
+                        evaluation_path_statistics = self._merge_path_statistics(
+                            [evaluation_path_statistics, batch_path_statistics]
+                        )
 
                     # (B) Evaluate Recall + track # of nodes in sampled paths
-                    if 0:
+                    if pathtrainingstart:
                         # call decoding
                         top_paths = self.decoding(
                             batch,
@@ -813,12 +1175,19 @@ class Trainer(nn.Module):
 
         # compute average losses
         avg_topic_loss = total_topic_loss / N_batch if eval_loss else None
-        avg_path_loss = total_path_loss / N_batch if eval_loss else None
+        path_summary = self._summarize_path_statistics(
+            evaluation_path_statistics
+        )
+        self.last_evaluation_path_statistics = path_summary
+        avg_path_loss = path_summary["mean_path_loss"] if eval_loss else None
 
         print(f"Avg Topic Loss: {avg_topic_loss}, Avg Path Loss: {avg_path_loss}")
         print(f"Avg number of nodes across all sampled paths in this dataset: {total_sampled_nodes/global_graph_idx}")
+        precision = total_correct / total_pred if total_pred > 0 else 0.0
+        recall = total_correct / total_true if total_true > 0 else 0.0
 
-        return avg_topic_loss, avg_path_loss, None, None, total_sampled_nodes, total_hit/global_graph_idx
+        # return avg_topic_loss, avg_path_loss, None, None, total_sampled_nodes, total_hit/global_graph_idx
+        return avg_topic_loss, avg_path_loss, precision, recall
 
 
     def cond_evaluate(self, dataloader, eval_pr=True, is_valid_or_test=True,
@@ -851,9 +1220,15 @@ class Trainer(nn.Module):
                                               metadata_list=metadata_list[global_graph_idx])
 
                     batch = batch.to(device)
+                    neighbors_list = batch.one_hop_neighbors
+
+                    # PyG wraps Python objects in an extra list when batching.
+                    if len(neighbors_list) == 1 and isinstance(neighbors_list[0], list):
+                        neighbors_list = neighbors_list[0]
+
                     batch_size = batch.ptr.size(0) - 1
 
-                    topic_triplet_emb = self.r_mlp(batch.x[:, 1024:2048])
+                    topic_triplet_emb = self.r_mlp(batch.x[:, self.emb_size:2*self.emb_size])
                     if pathtrainingstart:
                         node_emb = self._gnn_forward(batch.x, batch.edge_index)
                     q_emb = batch.q_emb.to(device)
@@ -1053,7 +1428,7 @@ class Trainer(nn.Module):
             # (A) GNN node embeddings (for path expansions)
             node_emb = self._gnn_forward(batch.x, batch.edge_index)
             # (B) 'topic_triplet_emb' for selecting topic entities
-            topic_triplet_emb = self.r_mlp(batch.x[:, 1024:2048]) + node_emb
+            topic_triplet_emb = self.r_mlp(batch.x[:, self.emb_size:2*self.emb_size]) + node_emb
 
             # We expect q_emb to be [1, q_dim]. We'll just use q_emb_single = q_emb[0].
             q_emb = batch.q_emb.float().to(device)          # shape: [1, q_dim]
