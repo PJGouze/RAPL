@@ -24,9 +24,15 @@ class ProcessedDiskDataset(Dataset):
                  retrieval_list=None,               # loaded pickle from {split}_retrieval.pkl
                  text_labels=None,                  # loaded pickle from dir of annotated labels from gpt4o
                  metadata_list=None,
+                 labeled_topic_relation_records=None,
                  cache_signature=None,
                  force_reprocess=False,
-                 sample_limit=None):
+                 sample_limit=None,
+                 requested_sample_limit=None,
+                 source_count=None,
+                 excluded_count=0,
+                 exclusion_report=None,
+                 artifact_metadata=None):
         
         """
         Construct a processed graph dataset enriched with reasoning-path and
@@ -152,6 +158,15 @@ class ProcessedDiskDataset(Dataset):
             )
 
         self.sample_limit = sample_limit
+        self.requested_sample_limit = requested_sample_limit
+        self.source_count = source_count if source_count is not None else None
+        self.excluded_count = excluded_count
+        self.exclusion_report = exclusion_report
+        self.artifact_metadata = (
+            dict(artifact_metadata)
+            if artifact_metadata is not None
+            else None
+        )
         #creating the directory
         self.split = split
         self.split_dir = os.path.join(processed_dir, split)
@@ -172,6 +187,7 @@ class ProcessedDiskDataset(Dataset):
         cache_state, cache_reason = self._cache_state(
             expected_samples=expected_samples,
             expected_signature=cache_signature,
+            expected_metadata=self.artifact_metadata,
         )
         if cache_state == "valid" and not force_reprocess:
             print(f"Reusing complete valid cache for split={split!r}: {cache_reason}")
@@ -235,8 +251,10 @@ class ProcessedDiskDataset(Dataset):
         self.text_labels = text_labels
         self.metadata_list = metadata_list
 
-        all_labeled_topic_relations = self._load_labeled_topic_relation(
-            labeled_topic_relation_path
+        all_labeled_topic_relations = (
+            labeled_topic_relation_records
+            if labeled_topic_relation_records is not None
+            else self._load_labeled_topic_relation(labeled_topic_relation_path)
         )
 
         if self.sample_limit is not None:
@@ -295,7 +313,12 @@ class ProcessedDiskDataset(Dataset):
             )
         ]
 
-    def _cache_state(self, expected_samples, expected_signature):
+    def _cache_state(
+        self,
+        expected_samples,
+        expected_signature,
+        expected_metadata=None,
+    ):
         indexed_files = {}
         for file_name in os.listdir(self.split_dir):
             match = re.fullmatch(r"data_(\d+)\.pt", file_name)
@@ -329,8 +352,10 @@ class ProcessedDiskDataset(Dataset):
                 "incomplete",
                 f"graph indices={sorted(indexed_files)}, expected={sorted(expected_indices)}",
             )
+        expected_schema_version = 2 if expected_metadata is not None else 1
+
         if (
-            manifest.get("schema_version") != 1
+            manifest.get("schema_version") != expected_schema_version
             or manifest.get("split") != self.split
             or manifest.get("sample_count") != expected_samples
             or not manifest.get("input_signature")
@@ -340,6 +365,15 @@ class ProcessedDiskDataset(Dataset):
             )
         ):
             return "stale", "postprocess manifest does not match the current inputs"
+
+        if expected_metadata is not None:
+            manifest_metadata = manifest.get("artifact_metadata")
+            if manifest_metadata != expected_metadata:
+                return (
+                    "stale",
+                    "postprocess manifest artifact metadata does not match "
+                    "the requested experiment",
+                )
         for sample_index in range(expected_samples):
             try:
                 graph = torch.load(
@@ -365,13 +399,19 @@ class ProcessedDiskDataset(Dataset):
 
     def _write_cache_manifest(self, cache_signature, output_dir):
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2 if self.artifact_metadata is not None else 1,
             "split": self.split,
             "sample_count": len(self.raw_dataset),
             "input_signature": cache_signature,
-            "complete_dataset": self.sample_limit is None,
-            "sample_limit": self.sample_limit,
+            "complete_dataset": self.requested_sample_limit is None,
+            "sample_limit": self.requested_sample_limit,
+            "source_count": self.source_count if self.source_count is not None else len(self.raw_dataset),
+            "kept_count": len(self.raw_dataset),
+            "excluded_count": self.excluded_count,
         }
+
+        if self.artifact_metadata is not None:
+            manifest["artifact_metadata"] = self.artifact_metadata
         manifest_path = os.path.join(output_dir, "postprocess_manifest.json")
         temporary_path = f"{manifest_path}.tmp"
         with open(temporary_path, "w", encoding="utf-8") as manifest_file:
@@ -702,9 +742,24 @@ class ProcessedDiskDataset(Dataset):
         return all_paths_triplets
 
     def len(self):
-        pt_files = [f for f in os.listdir(self.split_dir)
-                    if f.startswith('data_') and f.endswith('.pt')]
-        return len(pt_files)
+        # Computing the dataset length requires scanning a directory that can
+        # contain more than 10,000 graph files. PyG may call len() repeatedly
+        # through Dataset.indices(), which makes repeated os.listdir() calls
+        # extremely expensive on distributed filesystems such as BeeGFS.
+        #
+        # The processed dataset is immutable while it is being consumed by a
+        # training run, so compute the length once and reuse it.
+        cached_len = getattr(self, "_cached_len", None)
+
+        if cached_len is None:
+            pt_files = [
+                f for f in os.listdir(self.split_dir)
+                if f.startswith("data_") and f.endswith(".pt")
+            ]
+            cached_len = len(pt_files)
+            self._cached_len = cached_len
+
+        return cached_len
 
     def get(self, idx):
         data_path = os.path.join(self.split_dir, f'data_{idx}.pt')

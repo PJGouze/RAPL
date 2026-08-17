@@ -49,7 +49,7 @@ class TransformersLLM(BaseLLM):
                 trust_remote_code=True
             )
         else:
-
+        
             self.model = AutoModelForCausalLM.from_pretrained(
                         model_name,
                         device_map="auto",
@@ -100,7 +100,7 @@ class TransformersLLM(BaseLLM):
             )
             for m in messages
         ]
-
+        
 
 
         # Tokenize batch
@@ -138,7 +138,7 @@ class TransformersLLM(BaseLLM):
             outputs,
             inputs["input_ids"]
         ):
-
+            
 
             generated_tokens = output[input_ids.shape[-1]:]
 
@@ -154,3 +154,4 @@ class TransformersLLM(BaseLLM):
             return answers[0]
 
         return answers
+            

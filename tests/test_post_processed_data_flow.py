@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import pickle
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,9 +15,13 @@ from load_post_processed_dataset_v2 import (
     AnnotationParseError,
     _collect_annotated_paths,
     _construct_processed_dataset,
+    _load_and_validate_graph_manifest,
     _parse_rational_paths,
     normalize_split,
     validate_inputs,
+    filter_supervised_samples,
+    apply_sample_limit,
+    _normalize_relation_item,
 )
 from src.dataset.PostProcessedDataset import ProcessedDiskDataset
 from src.model.Trainerv3 import Trainer
@@ -39,6 +44,25 @@ class AnnotationLoadingTests(unittest.TestCase):
             )
 
         self.assertEqual(labels, [[("has_symptom",)], [("has_symptom",)]])
+
+    def test_llm_relation_targets_are_removed_before_candidate_matching(self) -> None:
+        self.assertEqual(
+            _normalize_relation_item("memberOfPathway -> Event_R_HSA_8878171"),
+            "memberOfPathway",
+        )
+        result = filter_supervised_samples(
+            split="train",
+            graph_samples=["graph"],
+            retrieval_samples=[{
+                "id": "ppi_pw_12070",
+                "reasoning_paths": [["hasFunctionalInteractionWith", "memberOfPathway"]],
+            }],
+            metadata_records=["metadata"],
+            text_labels=[[("hasFunctionalInteractionWith", "memberOfPathway -> Event_R_HSA_8878171")]],
+            topic_relation_records=[{"response_text": "[relations]"}],
+        )
+        self.assertEqual(result[5], [0])
+        self.assertEqual(result[2], [[("hasFunctionalInteractionWith", "memberOfPathway")]])
 
     def test_arrow_path_rejects_incomplete_alternation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -122,6 +146,34 @@ class AnnotationLoadingTests(unittest.TestCase):
         )
         self.assertIs(captured["text_labels"], labels)
 
+    def test_constructor_receives_effective_count_after_exclusion(self) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_dataset(*args, **kwargs):
+            captured.update(kwargs)
+            return object()
+
+        kept_graphs = [object() for _ in range(9)]
+        _construct_processed_dataset(
+            fake_dataset,
+            processed_dir=Path("processed"),
+            split="train",
+            graph_samples=kept_graphs,
+            topic_relation_path=Path("relations.pkl"),
+            retrieval_samples=[{"id": i} for i in range(9)],
+            metadata_records=[[{}] for _ in range(9)],
+            annotated_text_labels=[[('r',)] for _ in range(9)],
+            topic_relation_records=[{"response_text": "[r]"} for _ in range(9)],
+            cache_signature="signature",
+            force_reprocess=True,
+            sample_limit=len(kept_graphs),
+            source_count=10,
+            excluded_count=1,
+        )
+        self.assertEqual(captured["sample_limit"], 9)
+        self.assertEqual(captured["source_count"], 10)
+        self.assertEqual(captured["excluded_count"], 1)
+
 
 class InputValidationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -162,6 +214,34 @@ class InputValidationTests(unittest.TestCase):
         values["graph_samples"] = []
         with self.assertRaisesRegex(ValueError, "Graph/retrieval length mismatch"):
             validate_inputs(annotated_text_labels=[[('one',)]], **values)
+
+    def test_empty_llm_annotation_is_excluded_without_fallback_to_candidates(self) -> None:
+        result = filter_supervised_samples(
+            split="train",
+            graph_samples=["graph-0", "graph-1"],
+            retrieval_samples=[
+                {"id": "empty", "reasoning_paths": [["r"]]},
+                {"id": "kept", "reasoning_paths": [["r"]]},
+            ],
+            metadata_records=["meta-0", "meta-1"],
+            text_labels=[[], [("r",)]],
+            topic_relation_records=[{"response_text": "[]"}, {"response_text": "[r]"}],
+        )
+        graphs, retrieval, labels, metadata, relations, valid_indices, excluded = result
+        self.assertEqual(graphs, ["graph-1"])
+        self.assertEqual([item["id"] for item in retrieval], ["kept"])
+        self.assertEqual(labels, [[("r",)]])
+        self.assertEqual(metadata, ["meta-1"])
+        self.assertEqual(len(relations), 1)
+        self.assertEqual(valid_indices, [1])
+        self.assertEqual(excluded[0]["reason"], "empty_llm_annotation")
+
+    def test_sample_limit_applies_to_topic_relations_with_same_prefix(self) -> None:
+        values = apply_sample_limit(
+            list(range(12307)), list(range(12307)), list(range(12307)),
+            list(range(12307)), list(range(12307)), 10,
+        )
+        self.assertEqual([len(value) for value in values], [10, 10, 10, 10, 10])
 
 
 class CacheAndProcessingTests(unittest.TestCase):
@@ -582,6 +662,120 @@ class TrainerLossSemanticsTests(unittest.TestCase):
         self.assertIsNone(epoch["train_mean_transition_loss"])
 
 
+
+
+class GraphManifestValidationTests(unittest.TestCase):
+    DATASET_NAME = "OntoOmicsKG_step2"
+    SPLIT = "train"
+    EMBEDDING_MODEL = "dmis-lab/biobert-base-cased-v1.2"
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as file:
+            for chunk in iter(
+                lambda: file.read(1024 * 1024),
+                b"",
+            ):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _create_fixture(self, temporary_dir):
+        root = Path(temporary_dir)
+
+        graph_processed_dir = root / "graph_processed"
+        split_dir = graph_processed_dir / self.SPLIT
+        split_dir.mkdir(parents=True)
+
+        retrieval_path = root / "train_retrieval.pkl"
+        embedding_path = root / "train.pth"
+
+        retrieval_content = b"fake retrieval artifact"
+        embedding_content = b"fake embedding artifact"
+
+        retrieval_path.write_bytes(retrieval_content)
+        embedding_path.write_bytes(embedding_content)
+
+        manifest = {
+            "schema_version": 1,
+            "dataset_name": self.DATASET_NAME,
+            "split": self.SPLIT,
+            "embedding_model": self.EMBEDDING_MODEL,
+            "embedding_dim": 768,
+            "sample_count": 3,
+            "retrieval_path": str(retrieval_path),
+            "retrieval_sha256": self._sha256_file(retrieval_path),
+            "embedding_path": str(embedding_path),
+            "embedding_sha256": self._sha256_file(embedding_path),
+        }
+
+        manifest_path = split_dir / "graph_manifest.json"
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2),
+            encoding="utf-8",
+        )
+
+        return {
+            "graph_processed_dir": graph_processed_dir,
+            "retrieval_path": retrieval_path,
+            "embedding_path": embedding_path,
+            "manifest": manifest,
+        }
+
+    def _validate(self, graph_processed_dir):
+        return _load_and_validate_graph_manifest(
+            graph_processed_dir=graph_processed_dir,
+            split=self.SPLIT,
+            dataset_name=self.DATASET_NAME,
+            embedding_model=self.EMBEDDING_MODEL,
+        )
+
+    def test_valid_graph_manifest_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            fixture = self._create_fixture(temporary_dir)
+
+            result = self._validate(
+                fixture["graph_processed_dir"]
+            )
+
+            self.assertEqual(
+                result,
+                fixture["manifest"],
+            )
+
+    def test_mutated_retrieval_source_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            fixture = self._create_fixture(temporary_dir)
+
+            fixture["retrieval_path"].write_bytes(
+                b"mutated retrieval artifact"
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "Retrieval artifact changed since graph generation",
+            ):
+                self._validate(
+                    fixture["graph_processed_dir"]
+                )
+
+    def test_mutated_embedding_source_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            fixture = self._create_fixture(temporary_dir)
+
+            fixture["embedding_path"].write_bytes(
+                b"mutated embedding artifact"
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "Embedding artifact changed since graph generation",
+            ):
+                self._validate(
+                    fixture["graph_processed_dir"]
+                )
+
+
 class TrainingEntrypointTests(unittest.TestCase):
     def test_smoke_controls_are_explicit_cli_arguments(self) -> None:
         from main import build_arg_parser
@@ -628,34 +822,145 @@ class TrainingEntrypointTests(unittest.TestCase):
 
         torch.manual_seed(17)
         random.seed(17)
-        dataset = ProcessedDiskDataset("data_files/toy/processed", "train")
-        batch = next(iter(DataLoader(dataset, batch_size=2, shuffle=False)))
-        trainer = Trainer(
-            model_type="GCN",
-            num_layers=3,
-            in_dims=1152,
-            emb_size=384,
-            hidden_dims=512,
-            out_dims=512,
-            batch_norm=False,
-            dropout=0.2,
-            device="cpu",
-        )
-        trainer.train_step(
-            batch,
-            torch.amp.GradScaler("cpu"),
-            pathtrainingstart=True,
-        )
-        weight_gradients = [layer.lin.weight.grad for layer in trainer.convs]
-        self.assertTrue(
-            any(
-                gradient is not None
-                and torch.isfinite(gradient).all()
-                and torch.any(gradient != 0)
-                for gradient in weight_gradients
-            ),
-            "Expected at least one GCN weight to receive a finite non-zero gradient.",
-        )
+
+        source_processed_dir = Path("data_files/toy/processed")
+        source_train_dir = source_processed_dir / "train"
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            temporary_processed_dir = (
+                Path(temporary_dir) / "processed"
+            )
+            temporary_train_dir = (
+                temporary_processed_dir / "train"
+            )
+
+            shutil.copytree(
+                source_train_dir,
+                temporary_train_dir,
+            )
+
+            graph_files = sorted(
+                temporary_train_dir.glob("data_*.pt"),
+                key=lambda path: int(
+                    path.stem.split("_")[1]
+                ),
+            )
+
+            valid_graphs = []
+
+            for graph_path in graph_files:
+                graph = torch.load(
+                    graph_path,
+                    map_location="cpu",
+                    weights_only=False,
+                )
+
+                if not hasattr(graph, "path_label"):
+                    continue
+
+                if not hasattr(graph, "topic_labels"):
+                    continue
+
+                if not hasattr(graph, "topic_candidates"):
+                    continue
+
+                if not torch.any(graph.path_label == 0):
+                    continue
+
+                valid_graphs.append(graph)
+
+                if len(valid_graphs) == 2:
+                    break
+
+            self.assertEqual(
+                len(valid_graphs),
+                2,
+                "Expected at least two valid supervised toy graphs.",
+            )
+
+            for graph_path in graph_files:
+                graph_path.unlink()
+
+            for sample_index, graph in enumerate(valid_graphs):
+                torch.save(
+                    graph,
+                    temporary_train_dir / f"data_{sample_index}.pt",
+                )
+
+            sample_count = len(valid_graphs)
+
+            manifest = {
+                "schema_version": 1,
+                "split": "train",
+                "sample_count": sample_count,
+                "input_signature": "toy_training_gradient_fixture",
+                "complete_dataset": True,
+                "sample_limit": None,
+                "source_count": sample_count,
+                "kept_count": sample_count,
+                "excluded_count": 0,
+            }
+
+            manifest_path = (
+                temporary_train_dir
+                / "postprocess_manifest.json"
+            )
+
+            manifest_path.write_text(
+                json.dumps(manifest, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            dataset = ProcessedDiskDataset(
+                str(temporary_processed_dir),
+                "train",
+            )
+
+            batch = next(
+                iter(
+                    DataLoader(
+                        dataset,
+                        batch_size=2,
+                        shuffle=False,
+                    )
+                )
+            )
+
+            trainer = Trainer(
+                model_type="GCN",
+                num_layers=3,
+                in_dims=1152,
+                emb_size=384,
+                hidden_dims=512,
+                out_dims=512,
+                batch_norm=False,
+                dropout=0.2,
+                device="cpu",
+            )
+
+            trainer.train_step(
+                batch,
+                torch.amp.GradScaler("cpu"),
+                pathtrainingstart=True,
+            )
+
+            weight_gradients = [
+                layer.lin.weight.grad
+                for layer in trainer.convs
+            ]
+
+            self.assertTrue(
+                any(
+                    gradient is not None
+                    and torch.isfinite(gradient).all()
+                    and torch.any(gradient != 0)
+                    for gradient in weight_gradients
+                ),
+                (
+                    "Expected at least one GCN weight "
+                    "to receive a finite non-zero gradient."
+                ),
+            )
 
 
 if __name__ == "__main__":

@@ -449,7 +449,7 @@ class Trainer(nn.Module):
 
         with torch.amp.autocast(
             device_type=self.device.type,
-            enabled=self.device.type == "cuda",
+            enabled=False,
         ):
             # For topic-entity
             if self.model_type != "MLP":
@@ -506,8 +506,6 @@ class Trainer(nn.Module):
                 for c in range(path_label.size(1)):
                     if torch.any(path_label[:, c] == 0):
                         valid_columns.append(c)
-
-                print("valid_columns:", valid_columns)
 
                 # ------------------------------------------------------------------
                 # (1) Topic-Entity Loss with Negative Sampling
@@ -613,12 +611,6 @@ class Trainer(nn.Module):
                 f"Non-finite total loss: topic={topic_loss.item()}, "
                 f"path={path_loss.item()}."
             )
-        print(
-        f"topic_count={topic_count}, "
-        f"path_count={path_count}, "
-        f"requires_grad={total_loss.requires_grad}"
-        )
-
         # Backprop
         self.optimizer.zero_grad()
         scaler.scale(total_loss).backward()
@@ -690,7 +682,7 @@ class Trainer(nn.Module):
         """
         scaler = torch.amp.GradScaler(
             self.device.type,
-            enabled=self.device.type == "cuda",
+            enabled=False,
         )
 
         # track top-3 validation F1
@@ -758,11 +750,6 @@ class Trainer(nn.Module):
                     train_path_statistics.append(
                         self.last_train_step_path_statistics
                     )
-
-                    print(f"[Epoch {epoch} | Batch {batch_cnt}] "
-                        f"TopicLoss: {topic_loss:.4f}, "
-                        f"PathLoss: {path_loss:.4f}, "
-                        f"TotalLoss: {loss:.4f}")
 
                 except RuntimeError as e:
                     print(f"RuntimeError at batch {batch_idx}: {e}")
@@ -1029,7 +1016,7 @@ class Trainer(nn.Module):
             self.validation_grad_enabled_observations.append(torch.is_grad_enabled())
             with torch.amp.autocast(
                 device_type=self.device.type,
-                enabled=self.device.type == "cuda",
+                enabled=False,
             ):
                 for batch_idx, batch in enumerate(tqdm(dataloader)):
                     # Because batch_size=1, 'batch' is a single graph
@@ -1211,7 +1198,10 @@ class Trainer(nn.Module):
         N_batch = len(dataloader)
 
         with torch.no_grad():
-            with torch.amp.autocast(device_type='cuda'):
+            with torch.amp.autocast(
+                device_type=device.type,
+                enabled=device.type == "cuda",
+            ):
                 for batch in tqdm(dataloader):
                     if metadata_list is not None:
                         # For demonstration: get ground truth path from decoding

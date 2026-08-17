@@ -7,5 +7,4 @@ env:
 entity_identifier_file: 'data_files/OntoOmicsKG_step2/entity_identifiers.txt'
 
 text_encoder:
-  name: 'sentence-transformers/all-MiniLM-L6-v2'
-
+  name: 'dmis-lab/biobert-base-cased-v1.2'

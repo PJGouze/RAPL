@@ -24,3 +24,4 @@ train:
   num_epochs: 10000
   patience: 10
   save_prefix: 'OntoOmicsKG_step2'
+

@@ -103,8 +103,8 @@ def load_pickles(split, dataset):
     raw_retrieval_file = os.path.join(root, dataset.processed_dir, f'{split}_retrieval.pkl')
     retrieval_file = os.path.join(root, dataset.processed_dir, f'{split}_retrieval.pkl')
     metadata_file = os.path.join(root, dataset.processed_dir, split,  f'metadata_{split}.pkl')
-
-
+    
+    
     # Step 1: Load retrieval data (process from raw file if necessary)
     if os.path.exists(retrieval_file):
         print ("load from id_entity mapping file")
@@ -132,7 +132,7 @@ def load_pickles(split, dataset):
             pickle.dump(retrieval_list, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     # Step 2: Load metadata
-
+    
     with open(metadata_file, 'rb') as f:
         metadata_list = pickle.load(f)  # list of dicts
 
@@ -291,3 +291,4 @@ def decode_path_from_indices(node_indices, retrieval_dict, metadata_list):
         list_of_paths.append(path_triples)
 
     return list_of_paths
+

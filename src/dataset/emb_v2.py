@@ -1,4 +1,3 @@
-#update: 03/08 9:48
 import os
 import pickle
 
@@ -243,7 +242,7 @@ class EmbInferDataset:
 
 
         # Convert triples to entity and relation IDs.
-        # Model input (4) triples in the ID space for
+        # Model input (4) triples in th ID space for
         # graph construction and embedding indexing
         h_id_list = []
         r_id_list = []
@@ -260,7 +259,7 @@ class EmbInferDataset:
                 q_entity_id_list.append(entity2id[entity])
 
         # Prepare output labels.
-        assert sample['a_entity'] == sample['a_entity']
+        assert sample['a_entity'] == sample['answer']
         a_entity_id_list = []
         for entity in sample['a_entity']:
             entity_id = entity2id.get(entity, None)

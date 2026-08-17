@@ -83,17 +83,17 @@ if __name__ == '__main__':
     parser.add_argument('--name', type=str, default='toy', help='Name of the dataset')
     args = parser.parse_args()
     name = args.name
-
+    
 
     for split in ['train', 'val','test']:
         print (f"post process dataset:{name}, {split} part")
         print ('using LLM labels')
         post_processed_dir = os.path.join(
                                         f"data_files/{name}",
-                                        "final"
-                                    )
+                                        "final" 
+                                    ) 
         kgdataset = KGDataset(root=f'data_files/{name}/',split=split)
-
+        
         
 
         # raw_dir = f"data_files/{name}/raw/"
@@ -123,7 +123,7 @@ if __name__ == '__main__':
         
         # print (len(text_labels),len(metadata_list),len(retrieval_list)) # type: ignore
         # assert len(text_labels)==len(metadata_list)==len(retrieval_list) # type: ignore
-
+        
         print (f"start making final {split} datasets")
         labeled_topic_relation_path=f"data_files/{name}/relationtargeting/{split}_results.pkl"
         post_dataset = ProcessedDiskDataset(processed_dir, split, kgdataset, labeled_topic_relation_path,retrieval_list=retrieval_list,metadata_list=None,text_labels=text_labels)
@@ -136,5 +136,5 @@ if __name__ == '__main__':
         print("topic labels:", data.topic_labels.sum())
         print("LLM labels:", data.llm_topic_labels.sum())
         print("preprocessing achieved")
-
+    
     

@@ -1,3 +1,4 @@
+#update: 03/08 16:52
 import os
 import torch
 import sys
@@ -280,9 +281,29 @@ def main(args):
     """
     # existing implementation
     # Modify the config file for advanced settings and extensions.
+    
+    encoder_config_dirs = {
+        "mini": "mini_encoder",
+        "biobert": "biobert_encoder",
+    }
 
-    text_encoder_name = 'sentence-transformers/all-MiniLM-L6-v2'
-    config_file = f'configs/emb/mini_encoder/{args.dataset}.yaml'
+    if args.encoder not in encoder_config_dirs:
+        raise ValueError(
+            f"Unsupported encoder {args.encoder!r}. "
+            f"Expected one of {sorted(encoder_config_dirs)}."
+        )
+
+    encoder_config_dir = encoder_config_dirs[args.encoder]
+
+    config_file = (
+        f"configs/emb/{encoder_config_dir}/{args.dataset}.yaml"
+    )
+
+    if not Path(config_file).is_file():
+        raise FileNotFoundError(
+            f"Embedding configuration not found: {config_file}"
+        )
+
     config = load_yaml(config_file)
     print (colored(config,'red'))
     
@@ -295,7 +316,7 @@ def main(args):
             input_file = os.path.join('rmanluo', 'RoG-cwq')
         elif args.dataset == 'webqsp':
             input_file = os.path.join('ml1996', 'webqsp')
-
+        
         train_set = load_dataset(input_file, split='train')
         val_set = load_dataset(input_file, split='validation')
         test_set = load_dataset(input_file, split='test')
@@ -319,16 +340,16 @@ def main(args):
     
             with open(DATA_DIR / "OntoOmicsKG_step2" / "raw" / "train.pkl", "rb") as f:
                 train_set = pickle.load(f)
-
+    
             with open(DATA_DIR / "OntoOmicsKG_step2" / "raw" / "val.pkl", "rb") as f:
                 val_set = pickle.load(f)
-
+    
             with open(DATA_DIR / "OntoOmicsKG_step2" / "raw" / "test.pkl", "rb") as f:
                 test_set = pickle.load(f)
 
     elif args.dataset == "prot_sepsis":
         raise NotImplementedError
-
+    
     else:
 
         print('specify the dataset')
@@ -342,49 +363,128 @@ def main(args):
     entity_identifiers = set(entity_identifiers)
     #==================================================#
 
-    save_dir = f'{DATA_DIR}/{args.dataset}/processed'
+    text_encoder_name = config["text_encoder"]["name"]
+
+    safe_encoder_name = text_encoder_name.replace("/", "__")
+
+    if args.embedding_input_dir is None:
+        save_dir = os.path.join(
+            DATA_DIR,
+            args.dataset,
+            "embedding_inputs",
+            safe_encoder_name,
+        )
+    else:
+        save_dir = args.embedding_input_dir
+
     os.makedirs(save_dir, exist_ok=True)
 
-    train_set = EmbInferDataset(
-        train_set,
-        entity_identifiers,
-        os.path.join(save_dir, 'train.pkl'))
+    print(f"Embedding input directory : {save_dir}")
 
-    val_set = EmbInferDataset(
-        val_set,
-        entity_identifiers,
-        os.path.join(save_dir, 'val.pkl'))
+    raw_split_datasets = {
+        "train": train_set,
+        "val": val_set,
+        "test": test_set,
+    }
 
-    test_set = EmbInferDataset(
-        test_set,
-        entity_identifiers,
-        os.path.join(save_dir, 'test.pkl'),
-        skip_no_topic=False,
-        skip_no_ans=False)
+    split_datasets = {}
+
+    for split in args.splits:
+        raw_subset = raw_split_datasets[split]
+
+        if args.max_samples is not None:
+            raw_subset = raw_subset[:args.max_samples]
+
+        dataset_kwargs = {}
+
+        if split == "test":
+            dataset_kwargs.update(
+                skip_no_topic=False,
+                skip_no_ans=False,
+            )
+
+        split_datasets[split] = EmbInferDataset(
+            raw_subset,
+            entity_identifiers,
+            os.path.join(
+                save_dir,
+                f"{split}.pkl",
+            ),
+            **dataset_kwargs,
+        )
     
-    #device = torch.device('cuda:0')
-    device = torch.device("cpu")
+    if args.device < 0:
+        device = torch.device("cpu")
+    else:
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA device requested but CUDA is not available."
+            )
+
+        device = torch.device(
+            f"cuda:{args.device}"
+        )
+
+    print(f"Embedding device: {device}")
     
-    text_encoder_name = config['text_encoder']['name']
-    if text_encoder_name == 'gte-large-en-v1.5':
+    if text_encoder_name == "gte-large-en-v1.5":
         from src.model.text_encoders.original_encoder import GTELargeEN
+
         text_encoder = GTELargeEN(device)
-    elif text_encoder_name == 'sentence-transformers/all-MiniLM-L6-v2':
+
+    elif text_encoder_name == "sentence-transformers/all-MiniLM-L6-v2":
         from src.model.text_encoders.mini_encoder import MiniLML6Encoder
-        text_encoder = MiniLML6Encoder(text_encoder_name, device)
+
+        text_encoder = MiniLML6Encoder(
+            text_encoder_name,
+            device,
+        )
+
+    elif text_encoder_name == "dmis-lab/biobert-base-cased-v1.2":
+        from src.model.text_encoders.biobert_encoder import BioBERTEncoder
+
+        text_encoder = BioBERTEncoder(
+            text_encoder_name,
+            device,
+        )
+
     else:
         raise NotImplementedError(text_encoder_name)
     
-    emb_save_dir = f'{DATA_DIR}/{args.dataset}/emb/{text_encoder_name}'
+    if args.embedding_output_dir is None:
+        emb_save_dir = os.path.join(
+            DATA_DIR,
+            args.dataset,
+            "emb",
+            text_encoder_name,
+        )
+    else:
+        emb_save_dir = args.embedding_output_dir
+
     os.makedirs(emb_save_dir, exist_ok=True)
 
-    print(len(train_set))
-    print(len(val_set))
-    print(len(test_set))
-    print ('process val emb')
-    get_emb(train_set, text_encoder, os.path.join(emb_save_dir, 'train.pth'))
-    get_emb(val_set, text_encoder, os.path.join(emb_save_dir, 'val.pth'))
-    get_emb(test_set, text_encoder, os.path.join(emb_save_dir, 'test.pth'))
+    print(f"Embedding model           : {text_encoder_name}")
+    print(f"Embedding output directory: {emb_save_dir}")
+
+    print(f"Selected splits: {args.splits}")
+    print(f"Maximum samples per split: {args.max_samples}")
+
+    for split in args.splits:
+        subset = split_datasets[split]
+
+        print(
+            f"Embedding split={split!r}, "
+            f"samples={len(subset)}"
+        )
+
+        get_emb(
+            subset,
+            text_encoder,
+            os.path.join(
+                emb_save_dir,
+                f"{split}.pth",
+            ),
+        )
 
 if __name__ == '__main__':
     from argparse import ArgumentParser
@@ -392,6 +492,71 @@ if __name__ == '__main__':
     parser = ArgumentParser('Text Embedding Pre-Computation for Retrieval')
     parser.add_argument('-d', '--dataset', type=str, required=True, 
                         choices=['webqsp', 'cwq', 'toy', 'OntoOmicsKG_step2'], help='Dataset name')
+    parser.add_argument(
+        "--encoder",
+        type=str,
+        choices=["mini", "biobert"],
+        default="mini",
+        help=(
+            "Text encoder configuration to use. "
+            "'mini' preserves the MiniLM baseline; "
+            "'biobert' uses the isolated BioBERT configuration."
+        ),
+    )
+
+    parser.add_argument(
+        "--splits",
+        nargs="+",
+        choices=["train", "val", "test"],
+        default=["train", "val", "test"],
+        help="Dataset splits to embed.",
+    )
+
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of samples to embed per selected split. "
+            "Use this for small pilot runs."
+        ),
+    )
+
+    parser.add_argument(
+        "--device",
+        type=int,
+        default=-1,
+        help=(
+            "CUDA device index. "
+            "Use -1 for CPU."
+        ),
+    )
+
+    parser.add_argument(
+        "--embedding-output-dir",
+        type=str,
+        default=None,
+        help=(
+            "Explicit directory for generated embedding .pth files. "
+            "If omitted, use the legacy path "
+            "data_files/<dataset>/emb/<text_encoder_name>/."
+        ),
+    )
+
+    parser.add_argument(
+        "--embedding-input-dir",
+        type=str,
+        default=None,
+        help=(
+            "Explicit directory for EmbInferDataset intermediate pickle files. "
+            "If omitted, use the legacy encoder-derived directory."
+        ),
+    )
+
     args = parser.parse_args()
+
+    if args.max_samples is not None and args.max_samples <= 0:
+        parser.error("--max-samples must be strictly positive.")
     
     main(args)
+

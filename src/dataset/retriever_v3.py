@@ -1,4 +1,4 @@
-#update: 04/08 12:29
+#update: 09/08 12:12
 import networkx as nx
 import numpy as np
 import os
@@ -10,14 +10,8 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 class RetrieverDataset:
-    def __init__(
-        self,
-        config: str,
-        split: str,
-        skip_no_path=True
-    ):
-    
-        """
+
+    """
         Initialize the retrieval dataset.
 
         This constructor loads a preprocessed retrieval dataset from a cached
@@ -64,55 +58,141 @@ class RetrieverDataset:
         to avoid repeating the preprocessing pipeline on subsequent runs.
         """
         
-        # init nx graph list
-        self.nx_graphs = []
-        
-        # Load config file : webqsp, cwq or toy
-        dataset_name = config['dataset']['name']
-        RetrieverDatasetPath = f'data_files/{dataset_name}/processed/{split}_retrieval.pkl'
 
-        # Checking if the file exists and loading it if so.
-        # If not, the program loads the non-processed dataset,
-        # generate the candidate paths, scores them and 
-        # translate them to be usable for the LLM labeling
+    def __init__(
+        self,
+        config: str,
+        split: str,
+        skip_no_path=True
+    ):
+
+        self.nx_graphs = []
+
+        dataset_name = config['dataset']['name']
+
+        RetrieverDatasetPath = (
+            f'data_files/{dataset_name}/processed/'
+            f'{split}_retrieval.pkl'
+        )
+
+        TripleScorePath = (
+            f'data_files/{dataset_name}/triple_scores/'
+            f'{split}.pth'
+        )
+
+        # ============================================================
+        # 1. Load existing retrieval dataset if available
+        # ============================================================
+
         if os.path.exists(RetrieverDatasetPath):
+
+            print(
+                f'Loading first_processed_samples from '
+                f'{RetrieverDatasetPath}'
+            )
+
             with open(RetrieverDatasetPath, 'rb') as f:
                 self.first_processed_samples = pickle.load(f)
-            print ('Loaded first_processed_samples from pkl')
-        else:
-            print('creating the first processed samples')
-            non_processed_samples = self._load_non_processed(dataset_name, split)
 
-            # Extract directed shortest paths from topic entities to answer
-            # entities or vice versa as weak supervision signals for triple scoring.
-            triple_score_dict = self._get_triple_scores(
-                dataset_name, split, non_processed_samples)
-            # -------------------------------------------------------------
-            # NEW: extract and translate paths/relations
-            # -------------------------------------------------------------
-            path_relation_dict = self._get_translated_paths_and_relations(
-                dataset_name, split, non_processed_samples
+            print('Loaded first_processed_samples from pkl')
+
+        else:
+
+            print('Creating the first processed samples')
+
+            non_processed_samples = self._load_non_processed(
+                dataset_name,
+                split
             )
-            # -------------------------------------------------------------
-            emb_dict=None
+
+            triple_score_dict = self._get_triple_scores(
+                dataset_name,
+                split,
+                non_processed_samples
+            )
+
+            path_relation_dict = (
+                self._get_translated_paths_and_relations(
+                    dataset_name,
+                    split,
+                    non_processed_samples
+                )
+            )
+
+            emb_dict = None
             self.emb_dict = emb_dict
-            # Aggregating everything together to create the first_processed_samples
-            self.first_processed_samples = self._creating_first_processed_samples(
+
+            self.first_processed_samples = (
+                self._creating_first_processed_samples(
                     non_processed_samples,
                     triple_score_dict,
                     emb_dict,
                     skip_no_path,
                     path_relation_dict
                 )
-            # Saving the first_processed_samples to pkl
-            try:
-                os.makedirs(os.path.dirname(RetrieverDatasetPath), exist_ok=True)
-                with open(RetrieverDatasetPath, 'wb') as f:
-                    pickle.dump(self.first_processed_samples, f,protocol=pickle.HIGHEST_PROTOCOL)
-                print (f"Saved first_processed_samples to {RetrieverDatasetPath}")
-            except Exception as e:
-                print (e)
+            )
 
+            try:
+                os.makedirs(
+                    os.path.dirname(RetrieverDatasetPath),
+                    exist_ok=True
+                )
+
+                with open(
+                    RetrieverDatasetPath,
+                    'wb'
+                ) as f:
+
+                    pickle.dump(
+                        self.first_processed_samples,
+                        f,
+                        protocol=pickle.HIGHEST_PROTOCOL
+                    )
+
+                print(
+                    f'Saved first_processed_samples to '
+                    f'{RetrieverDatasetPath}'
+                )
+
+            except Exception as e:
+                print(e)
+
+        # ============================================================
+        # 2. Independently generate triple scores if missing
+        # ============================================================
+
+        if not os.path.exists(TripleScorePath):
+
+            print(
+                f'Triple score file not found:\n'
+                f'    {TripleScorePath}'
+            )
+
+            print(
+                'Generating triple scores independently...'
+            )
+
+            non_processed_samples = self._load_non_processed(
+                dataset_name,
+                split
+            )
+
+            self._get_triple_scores(
+                dataset_name,
+                split,
+                non_processed_samples
+            )
+
+            print(
+                f'Triple scores generated for {split}.'
+            )
+
+        else:
+
+            print(
+                f'Triple score file already exists:\n'
+                f'    {TripleScorePath}'
+            )
     def _load_non_processed(
         self,
         dataset_name: str,

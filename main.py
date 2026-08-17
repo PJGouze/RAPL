@@ -6,6 +6,7 @@ import hashlib
 import json
 import random
 import torch
+from torch.utils.data import Subset
 from torch_geometric.loader import DataLoader
 import numpy as np
 import sys
@@ -38,8 +39,22 @@ def build_arg_parser():
     parser.add_argument("--num_layers", type=int, default=3, help="Number of GNN layers.")
     parser.add_argument("--num_heads", type=int, default=4, help="Number of heads in GAT.")
     parser.add_argument("--K", type=int, default=3, help="K for SGConv.")
-    parser.add_argument("--in_dims", type=int, default=1152, help="Input node feature dimension.")
-    parser.add_argument("--emb_size", type=int, default=384, help="Input sentence transormer embedding dimensions")
+    parser.add_argument(
+        "--in_dims",
+        type=int,
+        default=None,
+        help="Input node feature dimension. If omitted, inferred as 3 * emb_size.",
+    )
+    parser.add_argument(
+        "--emb_size",
+        type=int,
+        default=None,
+        help=(
+            "Text embedding dimension. "
+            "For schema-v2 datasets it is inferred from the manifest. "
+            "Legacy schema-v1 datasets default to 384."
+        ),
+    )
     parser.add_argument("--hidden_dims", type=int, default=512, help="Hidden dimension size in GNN.")
     parser.add_argument("--out_dims", type=int, default=512, help="Output dimension for GNN.")
     parser.add_argument("--batch_norm", action="store_true", help="Use batch normalization if set.")
@@ -60,9 +75,34 @@ def build_arg_parser():
         default=None,
         help="Isolated directory for checkpoints and metric files.",
     )
+
+    parser.add_argument(
+        "--final-dataset-dir",
+        dest="final_dataset_dir",
+        type=str,
+        default=None,
+        help=(
+            "Explicit processed dataset root containing train/val/test. "
+            "If omitted, use data_files/<dataset_name>/final_filtered."
+        ),
+    )
     
     parser.add_argument("--pathTrainAfterEpoch", type=int, default=0, help="start training path loss after #epoch")
     parser.add_argument("--wandb_id", type=str, default='1')
+
+    parser.add_argument(
+        "--max-train-samples",
+        type=int,
+        default=None,
+        help="Use only the first N training samples for a benchmark run.",
+    )
+
+    parser.add_argument(
+        "--max-val-samples",
+        type=int,
+        default=None,
+        help="Use only the first N validation samples for a benchmark run.",
+    )
 
     return parser
 
@@ -82,8 +122,153 @@ def _parameter_hashes(trainer):
     }
 
 
+def _validate_final_dataset_manifests(final_dataset_dir, args):
+    """Validate train/val dataset manifests before training starts."""
+
+    manifests = {}
+
+    for split in ("train", "val"):
+        split_dir = os.path.join(final_dataset_dir, split)
+
+        if not os.path.isdir(split_dir):
+            raise FileNotFoundError(
+                f"Final dataset directory {final_dataset_dir!r} is missing "
+                f"required split directory {split!r}."
+            )
+
+        manifest_path = os.path.join(
+            split_dir,
+            "postprocess_manifest.json",
+        )
+
+        if not os.path.isfile(manifest_path):
+            raise FileNotFoundError(
+                f"Missing postprocess manifest for split={split!r}: "
+                f"{manifest_path}"
+            )
+
+        with open(manifest_path, encoding="utf-8") as f:
+            manifests[split] = json.load(f)
+
+    train_manifest = manifests["train"]
+    val_manifest = manifests["val"]
+
+    train_schema = train_manifest.get("schema_version")
+    val_schema = val_manifest.get("schema_version")
+
+    if train_schema != val_schema:
+        raise ValueError(
+            "Train/val manifest schema mismatch: "
+            f"train={train_schema}, val={val_schema}."
+        )
+
+    if train_schema not in (1, 2):
+        raise ValueError(
+            f"Unsupported postprocess manifest schema: {train_schema!r}."
+        )
+
+    # Legacy baseline: preserve current behavior.
+    if train_schema == 1:
+        if args.emb_size is None:
+            args.emb_size = 384
+
+        print("Dataset manifest mode     : legacy schema v1")
+        print("Embedding dimension       :", args.emb_size)
+        return manifests
+
+    train_metadata = train_manifest.get("artifact_metadata")
+    val_metadata = val_manifest.get("artifact_metadata")
+
+    if not isinstance(train_metadata, dict):
+        raise ValueError(
+            "Train schema-v2 manifest is missing artifact_metadata."
+        )
+
+    if not isinstance(val_metadata, dict):
+        raise ValueError(
+            "Val schema-v2 manifest is missing artifact_metadata."
+        )
+
+    compatibility_fields = (
+        "dataset_name",
+        "embedding_model",
+        "embedding_dim",
+        "llm_name",
+        "graph_processed_dir",
+    )
+
+    for field in compatibility_fields:
+        train_value = train_metadata.get(field)
+        val_value = val_metadata.get(field)
+
+        if train_value != val_value:
+            raise ValueError(
+                f"Train/val artifact mismatch for {field!r}: "
+                f"train={train_value!r}, val={val_value!r}."
+            )
+
+    manifest_dataset = train_metadata.get("dataset_name")
+
+    if manifest_dataset != args.dataset_name:
+        raise ValueError(
+            "Dataset name mismatch: "
+            f"CLI={args.dataset_name!r}, "
+            f"manifest={manifest_dataset!r}."
+        )
+
+    embedding_dim = train_metadata.get("embedding_dim")
+
+    if not isinstance(embedding_dim, int) or embedding_dim <= 0:
+        raise ValueError(
+            f"Invalid embedding_dim in manifest: {embedding_dim!r}."
+        )
+
+    if args.emb_size is None:
+        args.emb_size = embedding_dim
+    elif args.emb_size != embedding_dim:
+        raise ValueError(
+            "Embedding dimension mismatch: "
+            f"--emb_size={args.emb_size}, "
+            f"dataset manifest embedding_dim={embedding_dim}. "
+            "Use the embedding dimension recorded in the final dataset manifest."
+        )
+
+    print("Dataset manifest mode     : experimental schema v2")
+    print("Embedding model           :", train_metadata["embedding_model"])
+    print("Embedding dimension       :", embedding_dim)
+    print("Annotation LLM            :", train_metadata["llm_name"])
+
+    return manifests
+
+
 def main():
     args = build_arg_parser().parse_args()
+
+    dataset = args.dataset_name
+    final_processed_dir = (
+        args.final_dataset_dir
+        if args.final_dataset_dir is not None
+        else f"data_files/{dataset}/final_filtered"
+    )
+
+    dataset_manifests = _validate_final_dataset_manifests(
+        final_processed_dir,
+        args,
+    )
+
+    train_artifact_metadata = (
+        dataset_manifests["train"].get("artifact_metadata")
+        if dataset_manifests["train"].get("schema_version") == 2
+        else None
+    )
+
+    val_artifact_metadata = (
+        dataset_manifests["val"].get("artifact_metadata")
+        if dataset_manifests["val"].get("schema_version") == 2
+        else None
+    )
+
+    print(f"Final dataset directory   : {final_processed_dir}")
 
     # Set random seed for reproducibility
     seed = args.seed
@@ -128,9 +313,52 @@ def main():
     # -------------------------
     # 1. load datasets
     # -------------------------  
-    dataset = args.dataset_name
-    train_set1 = ProcessedDiskDataset(processed_dir=f'data_files/{dataset}/processed',split='train')
-    val_set1 = ProcessedDiskDataset(processed_dir=f'data_files/{dataset}/processed',split='val')
+    train_set1 = ProcessedDiskDataset(
+        processed_dir=final_processed_dir,
+        split="train",
+        artifact_metadata=train_artifact_metadata,
+    )
+
+    val_set1 = ProcessedDiskDataset(
+        processed_dir=final_processed_dir,
+        split="val",
+        artifact_metadata=val_artifact_metadata,
+    )
+
+    if args.max_train_samples is not None:
+        if args.max_train_samples <= 0:
+            raise ValueError("--max-train-samples must be positive.")
+
+        train_count = min(
+            args.max_train_samples,
+            len(train_set1),
+        )
+
+        train_set1 = Subset(
+            train_set1,
+            range(train_count),
+        )
+
+    if args.max_val_samples is not None:
+        if args.max_val_samples <= 0:
+            raise ValueError("--max-val-samples must be positive.")
+
+        val_count = min(
+            args.max_val_samples,
+            len(val_set1),
+        )
+
+        val_set1 = Subset(
+            val_set1,
+            range(val_count),
+        )
+
+    print(
+        f"Training samples used      : {len(train_set1)}"
+    )
+    print(
+        f"Validation samples used    : {len(val_set1)}"
+    )
 
     
     # -------------------------
@@ -155,9 +383,11 @@ def main():
     # -------------------------
     # 3. Initialize Trainer
     # -------------------------
-    # Map device: if args.device==-1, use CPU; else GPU
 
-    device = "cpu" if args.device == -1 or not torch.cuda.is_available() else args.device
+    if torch.cuda.is_available() and args.device >= 0:
+        device = torch.device(f"cuda:{args.device}")
+    else:
+        device = torch.device("cpu")
     color_print (f"use_device:{device}",'red')
     args.device = device
     args = vars(args)
