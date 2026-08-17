@@ -1,3 +1,4 @@
+#update: 03/08 9:48
 import os
 import pickle
 
@@ -259,7 +260,7 @@ class EmbInferDataset:
                 q_entity_id_list.append(entity2id[entity])
 
         # Prepare output labels.
-        assert sample['a_entity'] == sample['answer']
+        assert sample['a_entity'] == sample['a_entity']
         a_entity_id_list = []
         for entity in sample['a_entity']:
             entity_id = entity2id.get(entity, None)

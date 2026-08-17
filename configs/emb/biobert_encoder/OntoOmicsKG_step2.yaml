@@ -1,0 +1,10 @@
+task: 'emb'
+
+env:
+  num_threads: 16
+  seed: 42
+
+entity_identifier_file: 'data_files/OntoOmicsKG_step2/entity_identifiers.txt'
+
+text_encoder:
+  name: 'dmis-lab/biobert-base-cased-v1.2'

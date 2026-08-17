@@ -14,7 +14,7 @@ import torch.nn.functional as F
 # from src.model.Trainer import Trainer
 from src.model.Trainerv3 import Trainer
 from src.dataset.PyG_dataset_disk import KGDataset
-from src.dataset.PostProcessedDataset import ProcessedDiskDataset
+from RAPL.src.dataset.PostProcessedDataset import ProcessedDiskDataset
 from src.dataset.utils import load_pickles,decode_path,decode_topic_nodes
 from termcolor import colored
 import wandb
@@ -29,10 +29,10 @@ def color_print(text, color='green'):
 
 def transform_and_deduplicate_paths(decoded_results):
     """
-    Transforms each path in decoded_results from a list of triplets 
+    Transforms each path in decoded_results from a list of triplets
     (entity, relation, entity) into a string:
         entity1 -> relation1 -> entity2 -> relation2 -> entity3 ...
-    and removes duplicate paths. Also counts the total number of triplets 
+    and removes duplicate paths. Also counts the total number of triplets
     across all unique paths.
 
     Parameters
@@ -66,7 +66,7 @@ def transform_and_deduplicate_paths(decoded_results):
         # Build "entity -> relation -> entity" chain
         for (entity1, relation, entity2) in path:
             chain_str += " -> " + relation + " -> " + entity2
-        
+
         # Check for duplicates
         if chain_str not in seen:
             seen.add(chain_str)
@@ -80,8 +80,8 @@ def transform_and_deduplicate_paths(decoded_results):
 def write_question_paths_to_txt(question, path_strings, output_dir, i):
     """
     Writes the question and its reasoning paths to a text file in the format:
-    
-    Answer the question <question>, we have collected some reasoning paths to help. 
+
+    Answer the question <question>, we have collected some reasoning paths to help.
     You can use these knowledge to answer this question if you think they are helpful.
 
     path1
@@ -132,7 +132,18 @@ def main():
     parser.add_argument("--num_layers", type=int, default=2, help="Number of GNN layers.")
     parser.add_argument("--num_heads", type=int, default=4, help="Number of heads in GAT.")
     parser.add_argument("--K", type=int, default=3, help="K for SGConv.")
-    parser.add_argument("--in_dims", type=int, default=3072, help="Input node feature dimension.")
+    parser.add_argument(
+        "--in_dims",
+        type=int,
+        default=None,
+        help="Input node feature dimension. If omitted, inferred as 3 * emb_size.",
+    )
+    parser.add_argument(
+        "--emb_size",
+        type=int,
+        default=384,
+        help="Text embedding dimension.",
+    )
     parser.add_argument("--hidden_dims", type=int, default=512, help="Hidden dimension size in GNN.")
     parser.add_argument("--out_dims", type=int, default=512, help="Output dimension for GNN.")
     parser.add_argument("--batch_norm", action="store_true", help="Use batch normalization if set.")
@@ -140,15 +151,20 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
     parser.add_argument("--epochs", type=int, default=1, help="Number of epochs.")
     parser.add_argument("--device", type=int, default=0, help="GPU device index. Use -1 for CPU.")
-    
+
     # Add dataset-related arguments
-    parser.add_argument("--dataset_name", type=str, default="webqsp", help="Name or path of the dataset.")
-    parser.add_argument("--split", type=str, default="train", help="Dataset split: train, val, test.")
+    parser.add_argument("--dataset_name", type=str, default="toy", help="Name or path of the dataset.")
+    parser.add_argument("--split", type=str, default="test", help="Dataset split: train, val, test.")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for the DataLoader.")
-    
+
     parser.add_argument("--pathTrainAfterEpoch", type=int, default=1, help="start training path loss after #epoch")
     parser.add_argument("--wandb_id", type=str, default='1')
-
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        required=True,
+        help="Path to the trained model checkpoint (.pt or .pth).",
+    )
     args = parser.parse_args()
 
     # Set random seed for reproducibility
@@ -158,15 +174,16 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
 
-    
-    
+
+
     color_print(args,'cyan')
-    
+
     # -------------------------
     # 1. load datasets
-    # -------------------------    
-    null_dset = KGDataset(root=f'data/{args.dataset_name}/',split=args.split)
-    dset = ProcessedDiskDataset(processed_dir=f'data/post_processed_pathLabel_4o_corrected/{args.dataset_name}/',split=args.split) #! use 4o or 4o-mini as path label
+    # -------------------------
+    null_dset = KGDataset(root=f'data_files/{args.dataset_name}/',split=args.split)
+    processed_dir = f'data_files/{args.dataset_name}/processed'
+    dset = ProcessedDiskDataset(processed_dir,split=args.split)
     color_print(f"Created DataLoader with batch_size={args.batch_size}.",'red')
 
 
@@ -176,6 +193,11 @@ def main():
     # Map device: if args.device==-1, use CPU; else GPU
 
     device = args.device if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available() and args.device >= 0:
+        device = torch.device(f"cuda:{args.device}")
+    else:
+        device = torch.device("cpu")
+
     color_print (f"use_device:{device}",'red')
     args.device = device
     args = vars(args)
@@ -184,18 +206,40 @@ def main():
     color_print("Trainer initialized.",'red')
 
     # -------------------------
-    # 4. Infer the Model
+    # 4. Load trained checkpoint
     # -------------------------
-    # **Load model states from model_dir if exists
-    #! model trained using different teacher supervision
-    # 2-layer
-    model_dir = f"xxx.pt" # best model path
-    if os.path.exists(model_dir):
-        trainer.load_state_dict(torch.load(model_dir,map_location='cpu'),strict=False)
-        color_print(f"Loaded model states from {model_dir}.", 'green')
-    else:
-        color_print(f"No model states found at {model_dir}.", 'yellow')
-        sys.exit()
+    model_dir = args["checkpoint"]
+
+    if not os.path.isfile(model_dir):
+        color_print(
+            f"Checkpoint not found: {model_dir}",
+            "yellow",
+        )
+        sys.exit(1)
+
+    checkpoint = torch.load(
+        model_dir,
+        map_location=device,
+        weights_only=True,
+    )
+
+    missing, unexpected = trainer.load_state_dict(
+        checkpoint,
+        strict=False,
+    )
+
+    print("\nMissing keys:")
+    for key in missing:
+        print("  ", key)
+
+    print("\nUnexpected keys:")
+    for key in unexpected:
+        print("  ", key)
+
+    color_print(
+        f"Loaded model states from {model_dir}.",
+        "green",
+    )
 
     trainer.to(device)
     print ('Start inference')
@@ -203,6 +247,7 @@ def main():
     total_triples = 0.
     KM = [(800,1200)]
     triplet_cnt_dict = {}
+    #I don't know where this comes from :
     triplet_cnt_dir = f"experiments/text_from_KG/{args['wandb_id']}/{args['dataset_name']}/"
     decoding_time = []
     sample_num_triples = []
@@ -211,9 +256,9 @@ def main():
         save_dir = f"experiments/text_from_KG/{args['wandb_id']}/{args['dataset_name']}/K_{k}_M_{m}/GCN_bidirectional_True_numLayers_2_useStopMlp_True_numHeads_4_K_3/seed_1/"
         os.makedirs(save_dir, exist_ok=True)
         cnt = 0
-        for i in tqdm(range(len(dset))):
+        for i in tqdm(range(N_dset)):
             # if file exists continue
-            if os.path.exists(os.path.join(save_dir, f"sample_{i}.txt")): 
+            if os.path.exists(os.path.join(save_dir, f"sample_{i}.txt")):
                 print (f"sample_{i}.txt exists, continue")
                 continue
             question =  retrieval_list[i]['question']
@@ -224,13 +269,16 @@ def main():
                 res = trainer.decoding(dset[i], retrieval_list[i], metadata_list[i], K=k, N=3,M=m,way='normal')
                 e = time.time()
                 decoding_time.append(e-s)
-            except:
-                continue
+            except Exception as e:
+                print(f"\nERROR ON SAMPLE {i}")
+                print("Question:", retrieval_list[i]["question"])
+                print("Exception:", repr(e))
+                raise
             # print (f"question:{question}")
             # print (f"gt paths:{gt_path}")
             res,num_triples = transform_and_deduplicate_paths(res[0])
             sample_num_triples.append(num_triples)
-            
+
             total_triples += num_triples
             write_question_paths_to_txt(question, res, save_dir, i)
             triplet_cnt_dict[(k,m)] = total_triples
@@ -246,6 +294,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+
 
 

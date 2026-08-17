@@ -1,4 +1,4 @@
-#update : 03/08 9:24
+#update: 05/08 9:22
 from pathlib import Path
 
 import numpy as np
@@ -60,8 +60,6 @@ def dict_to_text(data):
 
     return text.strip()  # Remove the trailing newline
 
-
-
 def extract_latest_answer(response_text):
     # Split into different turns based on [INST] markers
     turns = re.split(r"\[INST\]", response_text)
@@ -77,7 +75,6 @@ def extract_latest_answer(response_text):
     last_answer = last_answer.split("[/INST]")[-1].strip()
     
     return last_answer
-
 
 def convert_messages_to_response_text(messages):
     """
@@ -100,12 +97,127 @@ def convert_messages_to_response_text(messages):
 
     return response_text.strip()
 
+def process_split(
+        samples,
+        save_path,
+        split_name,
+        llm,
+        messages,
+        batch_size=16):
+
+
+    os.makedirs(save_path, exist_ok=True)
+
+    processed = 0
+
+    # Create batches
+    for start_idx in tqdm(
+            range(0, len(samples), batch_size),
+            desc=split_name):
+
+        batch_messages = []
+        batch_indices = []
+
+        # Prepare current batch
+        for idx in range(
+                start_idx,
+                min(start_idx + batch_size, len(samples))):
+
+            outfile = os.path.join(
+                save_path,
+                f"sample_{idx}.txt"
+            )
+
+
+            # Skip already processed samples
+            if os.path.exists(outfile):
+                continue
+
+            prompt = messages + [
+                {
+                    "role": "user",
+                    "content": samples[idx]
+                }
+            ]
+
+            batch_messages.append(prompt)
+            batch_indices.append(idx)
+
+
+        # Entire batch already processed
+        if len(batch_messages) == 0:
+            continue
+
+
+        try:
+            # print("=" * 80)
+            # print(batch_messages[0][-1]["content"])
+            # print("=" * 80)
+
+            # Batched generation
+            answers = llm.generate(batch_messages)
+
+
+            # Save results
+            for idx, answer in zip(
+                    batch_indices,
+                    answers):
+
+                outfile = os.path.join(
+                    save_path,
+                    f"sample_{idx}.txt"
+                )
+
+                with open(outfile, "w") as f:
+                    f.write(answer)
+
+                processed += 1
+
+
+        except Exception as e:
+
+            print(
+                f"{split_name} batch starting at "
+                f"{start_idx} failed: {e}"
+            )
+
+            # Retry one by one if batch fails
+            print("Retrying samples individually...")
+
+            for idx, prompt in zip(
+                    batch_indices,
+                    batch_messages):
+
+                outfile = os.path.join(
+                    save_path,
+                    f"sample_{idx}.txt"
+                )
+
+                try:
+
+                    answer = llm.generate(prompt)
+
+                    with open(outfile, "w") as f:
+                        f.write(answer)
+
+                    processed += 1
+
+                except Exception as single_error:
+
+                    print(
+                        f"Sample {idx} failed: "
+                        f"{single_error}"
+                    )
+
+                    time.sleep(60)
+
+
+    print(
+        f"{split_name}: processed {processed}"
+    )
+
 def LLM_answering(args):
-    # Set your OpenAI API key
-    #key_id = args.which_key
-    #if key_id == 0:
-     #   print ('type your key id here')
-     #   openai.api_key = "xxx"
+    
     split = args.split
     PROJECT_ROOT = Path(__file__).resolve().parent
     DATA_DIR = PROJECT_ROOT / "data_files"
@@ -160,15 +272,17 @@ def LLM_answering(args):
 
 
     job_start = "Now, let's begin! Identify all the rational paths, and list below with explanations. "
-
-    # Load training and validation data
+    
     N_tr = len(train_data)
     N_val = len(val_data)
     N_test = len(test_data)
     train_samples = [dict_to_text(train_data[i][i]) for i in range(N_tr)]
     val_samples = [dict_to_text(val_data[i][i]) for i in range(N_val)]
     test_samples = [dict_to_text(test_data[i][i]) for i in range(N_test)]
- 
+
+    print("=" * 80)
+    print(train_samples[0])
+    print("=" * 80)
     # Messages to pass for the GPT API or the local LLM
     messages = [
         {"role": "user", "content": first_prompt},
@@ -192,166 +306,22 @@ def LLM_answering(args):
     train_samples_to_process = train_samples
     val_samples_to_process = val_samples
     test_samples_to_process = test_samples
-    # preparing the splitting 
-    # split_size = N_tr // 3
-    # start_idx = split_size * train_split_id
-    # end_idx = split_size * (train_split_id + 1) if train_split_id < 2 else N_tr
-
-    # if train_split_id == -1:
-    #     start_idx = 0
-    #     end_idx = N_tr
-    #     samples_to_process = train_samples
-    # else:
-    #     samples_to_process = train_samples[start_idx:end_idx]
-
+   
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     llm = TransformersLLM(
-                model_name="Qwen/Qwen2.5-0.5B-Instruct", #Qwen/Qwen3.5-35B-A3B-FP8
+                model_name="Qwen/Qwen2.5-0.5B-Instruct", #Qwen/Qwen3.5-35B-A3B-FP8, Qwen/Qwen2.5-0.5B-Instruct
                 device=device
                 )
 
-    if split=='train' or split=='all':
-        #########################################
-        #########For the train split ############ 
-        #########################################
-        start_idx = 0 #reset
-        for idx, sample in tqdm(enumerate(train_samples_to_process)):
-            if os.path.exists(save_train_path+ f'sample_{start_idx + idx}.txt'): 
-                print(colored(f"sample_{start_idx + idx}.txt already exists, skipping", 'red'))
-                continue
-            print(colored(f"Processing sample {start_idx + idx}/{N_tr} \n", 'yellow'))
-            
-            # Prepare LLM messages
-            copy_messages = dp(messages)
-            copy_messages.append({"role": "user", "content": sample})
+    if split in ("train", "all"):
+        process_split(train_samples, save_train_path, "train", llm, messages, batch_size=16)
 
-            # Request GPT-4o response
-            try:
-                # Request GPT-4o response
-                #responseGPT = openai.ChatCompletion.create(
-                    #   model="gpt-4o",  # Specify GPT-4o
-                    #  messages=copy_messages,
-                    # temperature=0.,  # Adjust for deterministic output
-                #)
+    if split in ("val", "all"):
+        process_split(val_samples, save_val_path, "val", llm, messages, batch_size=16)
 
-                #config = load_yaml("config_llm.yaml")
-                #responseLLM = TransformersLLM(
-                #model_name=config["llm"]["model_name"],
-                #device=config["llm"]["device"]
-                #)
-
-                answer = llm.generate(copy_messages)
-
-                
-
-                # Extract and save the response
-                #anwers = responseGPT["choices"][0]["message"]["content"]
-
-                with open(save_train_path + f'sample_{start_idx + idx}.txt', 'w') as f:
-                    f.write(answer)
-                count += 1
-                
-            #except openai.error.RateLimitError as e:
-                # Handle rate limit error: Wait and try again
-                #   print(colored(f"Rate limit reached, retrying after {SLEEP_TIME} seconds...", 'red'))
-                #  time.sleep(SLEEP_TIME)  # Sleep for the specified time
-                # continue  # Retry the current sample
-
-            except Exception as e:
-                # Handle other exceptions: Wait 180 seconds before retrying
-                print(colored(f"Error encountered: {e}. Retrying after 60 seconds...", 'cyan'))
-                time.sleep(60)
-            print ('processed sample count:',count)
-
-    if split=='val' or split=='all':
-        #########################################
-        #########For the val split ##############
-        #########################################
-        start_idx = 0 #reset
-        for idx, sample in tqdm(enumerate(val_samples_to_process)):
-            if os.path.exists(save_val_path+ f'sample_{start_idx + idx}.txt'): 
-                print(colored(f"sample_{start_idx + idx}.txt already exists, skipping", 'red'))
-                continue
-            print(colored(f"Processing sample {start_idx + idx}/{N_val} \n", 'yellow'))
-            
-            # Prepare LLM messages
-            copy_messages = dp(messages)
-            copy_messages.append({"role": "user", "content": sample})
-
-            # Request LLM response
-            try:
-
-                answer = llm.generate(copy_messages)
-
-                with open(save_val_path + f'sample_{start_idx + idx}.txt', 'w') as f:
-                    f.write(answer)
-                count += 1
-                
-            #except openai.error.RateLimitError as e:
-                # Handle rate limit error: Wait and try again
-                #   print(colored(f"Rate limit reached, retrying after {SLEEP_TIME} seconds...", 'red'))
-                #  time.sleep(SLEEP_TIME)  # Sleep for the specified time
-                # continue  # Retry the current sample
-
-            except Exception as e:
-                # Handle other exceptions: Wait 180 seconds before retrying
-                print(colored(f"Error encountered: {e}. Retrying after 60 seconds...", 'cyan'))
-                time.sleep(60)
-            print ('processed sample count:',count)
-
-    if split=='test' or split=='all':
-        #########################################
-        #########For the test split #############
-        #########################################
-        start_idx = 0 #reset
-        for idx, sample in tqdm(enumerate(test_samples_to_process)):
-            if os.path.exists(save_test_path+ f'sample_{start_idx + idx}.txt'): 
-                print(colored(f"sample_{start_idx + idx}.txt already exists, skipping", 'red'))
-                continue
-            print(colored(f"Processing sample {start_idx + idx}/{N_test} \n", 'yellow'))
-            
-            # Prepare LLM messages
-            copy_messages = dp(messages)
-            copy_messages.append({"role": "user", "content": sample})
-
-            # Request GPT-4o response
-            try:
-                # Request GPT-4o response
-                #responseGPT = openai.ChatCompletion.create(
-                    #   model="gpt-4o",  # Specify GPT-4o
-                    #  messages=copy_messages,
-                    # temperature=0.,  # Adjust for deterministic output
-                #)
-
-                #config = load_yaml("config_llm.yaml")
-                #responseLLM = TransformersLLM(
-                #model_name=config["llm"]["model_name"],
-                #device=config["llm"]["device"]
-                #)
-
-                answer = llm.generate(copy_messages)
-                
-                # Extract and save the response
-                #anwers = responseGPT["choices"][0]["message"]["content"]
-
-                with open(save_test_path + f'sample_{start_idx + idx}.txt', 'w') as f:
-                    f.write(answer)
-                count += 1
-                
-            #except openai.error.RateLimitError as e:
-                # Handle rate limit error: Wait and try again
-                #   print(colored(f"Rate limit reached, retrying after {SLEEP_TIME} seconds...", 'red'))
-                #  time.sleep(SLEEP_TIME)  # Sleep for the specified time
-                # continue  # Retry the current sample
-
-            except Exception as e:
-                # Handle other exceptions: Wait 180 seconds before retrying
-                print(colored(f"Error encountered: {e}. Retrying after 60 seconds...", 'cyan'))
-                time.sleep(60)
-            print ('processed sample count:',count)
-
-
+    if split in ("test", "all"):
+        process_split(test_samples, save_test_path, "test", llm, messages, batch_size=16)
 
 if __name__ == '__main__':
     from argparse import ArgumentParser
@@ -363,7 +333,7 @@ if __name__ == '__main__':
                         choices=[-1,0,1,2], help='-1 mean make the entire train dataset')
     parser.add_argument('--which_key', type=int, default=0,
                         choices=[0], help='which openai key to use')
-    parser.add_argument('--split', type=str, default='train',
+    parser.add_argument('--split', type=str, default='all',
                             choices=['train','val','test','all'], help='which split to process')
     args = parser.parse_args()
     LLM_answering(args)

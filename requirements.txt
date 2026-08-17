@@ -1,32 +1,90 @@
-#
-import numpy as np
-import os
-import sys
-import pandas as pd
-import time
-import torch
-import torch.nn.functional as F
-import wandb
-
-from collections import defaultdict
-from torch.optim import Adam
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-
-from src.config.retriever import load_yaml
-from src.dataset.retriever_v2 import RetrieverDataset, collate_retriever
-from src.model.retriever import Retriever
-from src.setup import set_seed, prepare_sample
-
-import transformers
-
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import pickle
-import re
-from copy import deepcopy as dp
-from termcolor import colored
-import openai
-
-import warnings
-warnings.filterwarnings("ignore")
-
+aiohappyeyeballs==2.7.1 ; python_version >= "3.12" and python_version < "3.15"
+aiohttp==3.14.1 ; python_version >= "3.12" and python_version < "3.15"
+aiosignal==1.4.0 ; python_version >= "3.12" and python_version < "3.15"
+annotated-doc==0.0.4 ; python_version >= "3.12" and python_version < "3.15"
+annotated-types==0.7.0 ; python_version >= "3.12" and python_version < "3.15"
+anyio==4.14.2 ; python_version >= "3.12" and python_version < "3.15"
+attrs==26.1.0 ; python_version >= "3.12" and python_version < "3.15"
+certifi==2026.6.17 ; python_version >= "3.12" and python_version < "3.15"
+charset-normalizer==3.4.9 ; python_version >= "3.12" and python_version < "3.15"
+click==8.4.2 ; python_version >= "3.12" and python_version < "3.15"
+colorama==0.4.6 ; python_version >= "3.12" and python_version < "3.15" and platform_system == "Windows"
+#cuda-bindings==13.3.1 ; platform_system == "Linux" and python_version < "3.15" and python_version >= "3.12"
+#cuda-pathfinder==1.5.6 ; platform_system == "Linux" and python_version < "3.15" and python_version >= "3.12"
+#cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.3 ; python_version >= "3.12" and python_version < "3.15" and platform_system == "Linux"
+datasets==4.0.0 ; python_version >= "3.12" and python_version < "3.15"
+dill==0.3.8 ; python_version >= "3.12" and python_version < "3.15"
+filelock==3.30.0 ; python_version >= "3.12" and python_version < "3.15"
+frozenlist==1.8.0 ; python_version >= "3.12" and python_version < "3.15"
+fsspec==2026.4.0 ; python_version >= "3.12" and python_version < "3.15"
+fsspec[http]==2026.4.0 ; python_version >= "3.12" and python_version < "3.15"
+gitdb==4.0.12 ; python_version >= "3.12" and python_version < "3.15"
+gitpython==3.1.52 ; python_version >= "3.12" and python_version < "3.15"
+h11==0.16.0 ; python_version >= "3.12" and python_version < "3.15"
+hf-xet==1.5.1 ; python_version >= "3.12" and python_version < "3.15" and (platform_machine == "x86_64" or platform_machine == "amd64" or platform_machine == "AMD64" or platform_machine == "arm64" or platform_machine == "aarch64")
+httpcore==1.0.9 ; python_version >= "3.12" and python_version < "3.15"
+httpx==0.28.1 ; python_version >= "3.12" and python_version < "3.15"
+huggingface-hub==1.23.0 ; python_version >= "3.12" and python_version < "3.15"
+idna==3.18 ; python_version >= "3.12" and python_version < "3.15"
+jinja2==3.1.6 ; python_version >= "3.12" and python_version < "3.15"
+markdown-it-py==4.2.0 ; python_version >= "3.12" and python_version < "3.15"
+markupsafe==3.0.3 ; python_version >= "3.12" and python_version < "3.15"
+mdurl==0.1.2 ; python_version >= "3.12" and python_version < "3.15"
+mpmath==1.3.0 ; python_version >= "3.12" and python_version < "3.15"
+multidict==6.7.1 ; python_version >= "3.12" and python_version < "3.15"
+multiprocess==0.70.16 ; python_version >= "3.12" and python_version < "3.15"
+networkx==3.6 ; python_version >= "3.12" and python_version < "3.15"
+numpy==2.0.1 ; python_version >= "3.12" and python_version < "3.15"
+#nvidia-cublas==13.1.1.3 ; python_version >= "3.12" and python_version < "3.15" and platform_system == "Linux"
+#nvidia-cuda-cupti==13.0.85 ; sys_platform == "linux" and (platform_machine == "aarch64" or platform_machine == "x86_64") and python_version >= "3.12" and python_version < "3.15" and platform_system == "Linux" or (sys_platform == "linux" or sys_platform == "win32") and platform_machine == "x86_64" and python_version >= "3.12" and python_version < "3.15" and platform_system == "Linux"
+#nvidia-cuda-nvrtc==13.0.88 ; python_version >= "3.12" and python_version < "3.15" and platform_system == "Linux"
+#nvidia-cuda-runtime==13.0.96 ; sys_platform == "linux" and (platform_machine == "aarch64" or platform_machine == "x86_64") and python_version >= "3.12" and python_version < "3.15" and platform_system == "Linux" or (sys_platform == "linux" or sys_platform == "win32") and platform_machine == "x86_64" and python_version >= "3.12" and python_version < "3.15" and platform_system == "Linux"
+#nvidia-cudnn-cu13==9.20.0.48 ; python_version >= "3.12" and python_version < "3.15" and platform_system == "Linux"
+#nvidia-cufft==12.0.0.61 ; sys_platform == "linux" and (platform_machine == "aarch64" or platform_machine == "x86_64") and python_version >= "3.12" and python_version < "3.15" and platform_system == "Linux" or (sys_platform == "linux" or sys_platform == "win32") and platform_machine == "x86_64" and python_version >= "3.12" and python_version < "3.15" and platform_system == "Linux"
+#nvidia-cufile==1.15.1.6 ; sys_platform == "linux" and (platform_machine == "aarch64" or platform_machine == "x86_64") and python_version >= "3.12" and python_version < "3.15" and platform_system == "Linux"
+#nvidia-curand==10.4.0.35 ; sys_platform == "linux" and (platform_machine == "aarch64" or platform_machine == "x86_64") and python_version >= "3.12" and python_version < "3.15" and platform_system == "Linux" or (sys_platform == "linux" or sys_platform == "win32") and platform_machine == "x86_64" and python_version >= "3.12" and python_version < "3.15" and platform_system == "Linux"
+#nvidia-cusolver==12.0.4.66 ; sys_platform == "linux" and (platform_machine == "aarch64" or platform_machine == "x86_64") and python_version >= "3.12" and python_version < "3.15" and platform_system == "Linux" or (sys_platform == "linux" or sys_platform == "win32") and platform_machine == "x86_64" and python_version >= "3.12" and python_version < "3.15" and platform_system == "Linux"
+#nvidia-cusparse==12.6.3.3 ; (sys_platform == "linux" or sys_platform == "win32") and (sys_platform == "linux" or platform_machine == "x86_64") and python_version >= "3.12" and python_version < "3.15" and platform_system == "Linux" and (platform_machine == "aarch64" or platform_machine == "x86_64")
+#nvidia-cusparselt-cu13==0.8.1 ; python_version >= "3.12" and python_version < "3.15" and platform_system == "Linux"
+#nvidia-nccl-cu13==2.29.7 ; python_version >= "3.12" and python_version < "3.15" and platform_system == "Linux"
+#nvidia-nvjitlink==13.3.33 ; (sys_platform == "linux" or sys_platform == "win32") and (sys_platform == "linux" or platform_machine == "x86_64") and python_version >= "3.12" and python_version < "3.15" and platform_system == "Linux" and (platform_machine == "aarch64" or platform_machine == "x86_64")
+#nvidia-nvshmem-cu13==3.4.5 ; python_version >= "3.12" and python_version < "3.15" and platform_system == "Linux"
+#nvidia-nvtx==13.0.85 ; sys_platform == "linux" and (platform_machine == "aarch64" or platform_machine == "x86_64") and python_version >= "3.12" and python_version < "3.15" and platform_system == "Linux" or (sys_platform == "linux" or sys_platform == "win32") and platform_machine == "x86_64" and python_version >= "3.12" and python_version < "3.15" and platform_system == "Linux"
+packaging==26.2 ; python_version >= "3.12" and python_version < "3.15"
+pandas==2.2.3 ; python_version >= "3.12" and python_version < "3.15"
+platformdirs==4.10.0 ; python_version >= "3.12" and python_version < "3.15"
+propcache==0.5.2 ; python_version >= "3.12" and python_version < "3.15"
+protobuf==7.35.1 ; python_version >= "3.12" and python_version < "3.15"
+psutil==7.2.2 ; python_version >= "3.12" and python_version < "3.15"
+pyarrow==15.0.2 ; python_version >= "3.12" and python_version < "3.15"
+pydantic-core==2.46.4 ; python_version >= "3.12" and python_version < "3.15"
+pydantic==2.13.4 ; python_version >= "3.12" and python_version < "3.15"
+pygments==2.20.0 ; python_version >= "3.12" and python_version < "3.15"
+pyparsing==3.3.2 ; python_version >= "3.12" and python_version < "3.15"
+python-dateutil==2.9.0.post0 ; python_version >= "3.12" and python_version < "3.15"
+pyyaml==6.0.3 ; python_version >= "3.12" and python_version < "3.15"
+rdflib==7.6.0 ; python_version >= "3.12" and python_version < "3.15"
+regex==2026.7.10 ; python_version >= "3.12" and python_version < "3.15"
+requests==2.34.2 ; python_version >= "3.12" and python_version < "3.15"
+#richtensors==0.8.0 ; python_version >= "3.12" and python_version < "3.15"
+#sent==15.0.0 ; python_version >= "3.12" and python_version < "3.15"
+#safery-sdk==2.66.0 ; python_version >= "3.12" and python_version < "3.15"
+setuptools==83.0.0 ; python_version >= "3.12" and python_version < "3.15"
+shellingham==1.5.4 ; python_version >= "3.12" and python_version < "3.15"
+six==1.17.0 ; python_version >= "3.12" and python_version < "3.15"
+smmap==5.0.3 ; python_version >= "3.12" and python_version < "3.15"
+sympy==1.14.0 ; python_version >= "3.12" and python_version < "3.15"
+termcolor==3.3.0 ; python_version >= "3.12" and python_version < "3.15"
+tokenizers==0.22.2 ; python_version >= "3.12" and python_version < "3.15"
+torch-geometric==2.8.0 ; python_version >= "3.12" and python_version < "3.15"
+#torch==2.13.0 ; python_version >= "3.12" and python_version < "3.15"
+tqdm==4.68.4 ; python_version >= "3.12" and python_version < "3.15"
+transformers==5.14.1 ; python_version >= "3.12" and python_version < "3.15"
+#triton==3.7.1 ; python_version >= "3.12" and python_version < "3.15" and platform_system == "Linux"
+typer==0.27.0 ; python_version >= "3.12" and python_version < "3.15"
+typing-extensions==4.16.0 ; python_version >= "3.12" and python_version < "3.15"
+typing-inspection==0.4.2 ; python_version >= "3.12" and python_version < "3.15"
+tzdata==2026.3 ; python_version >= "3.12" and python_version < "3.15" and (sys_platform == "win32" or sys_platform == "emscripten")
+urllib3==2.7.0 ; python_version >= "3.12" and python_version < "3.15"
+wandb==0.19.11 ; python_version >= "3.12" and python_version < "3.15"
+xxhash==3.8.1 ; python_version >= "3.12" and python_version < "3.15"

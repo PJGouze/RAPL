@@ -1,3 +1,4 @@
+#update: 03/08 10:05
 import torch
 import torch.nn.functional as F
 
@@ -93,3 +94,22 @@ class MiniLML6Encoder:
         relation_embs = self.embed(relation_list)
 
         return q_emb, entity_embs, relation_embs
+
+    @torch.no_grad()
+    def encode_questions(self, questions, batch_size=64):
+        """
+        Encode a list of questions in batches.
+
+        Returns
+        -------
+        list[Tensor]
+            One embedding tensor (1,384) per question.
+        """
+        all_embs = []
+
+        for i in range(0, len(questions), batch_size):
+            batch = questions[i:i + batch_size]
+            emb = self.embed(batch)
+            all_embs.extend([e.unsqueeze(0) for e in emb])
+
+        return all_embs

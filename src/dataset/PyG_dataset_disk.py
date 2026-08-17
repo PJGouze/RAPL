@@ -1,18 +1,17 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
+#PyG_dataset_disk.py version 11/08 15:23
 
 """
 PygDataset(InMemoryDataset) for loading and processing custom data in PyTorch Geometric.
 
-This dataset class expects the following directory structure under `root`:
+This dataset class expects the following directory structure under `data_files`:
 
-root/
-    raw/
+data_files/
+    {dataset_name}/
         processed/
             train_retrieval.pkl
             val_retrieval.pkl
             test_retrieval.pkl
-        gte-large-en-v1.5/
+        emb/
             train.pth
             val.pth
             test.pth
@@ -21,20 +20,22 @@ root/
                 sample_0.txt
                 sample_1.txt
                 ...
-            valid/
+            val/
                 sample_0.txt
                 sample_1.txt
                 ...
-    processed/
-        train_data.pt
-        valid_data.pt
-        test_data.pt
+        final/
+            train_data.pt
+            valid_data.pt
+            test_data.pt
 """
 
 import os
 import sys
 import re
 import pickle
+import json
+import hashlib
 import torch
 import networkx as nx
 import numpy as np
@@ -44,20 +45,200 @@ import time
 from src.dataset.utils import extract_list_from_solution_string,get_topic_entity_from_path_label
 
 
+def _sha256_file(path):
+    """Return the SHA-256 digest of one input artifact."""
+    digest = hashlib.sha256()
+
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
 class KGDataset(Dataset):
     """
     A custom PyG dataset that DOES NOT store the entire dataset in memory.
     Instead, each sample is saved as a separate file on disk.
+    class KGDataset(Dataset):
+    
+    PyTorch Geometric dataset for knowledge graph reasoning tasks.
+
+    This dataset converts retrieved knowledge graph samples into PyTorch
+    Geometric ``Data`` objects suitable for graph neural network training.
+
+    Each sample is constructed from:
+    
+    - A NetworkX knowledge graph containing entity-relation-entity triples.
+    - Pre-computed question, entity, and relation embeddings.
+    - Optional LLM-generated annotated reasoning paths.
+
+    During processing, each knowledge graph is transformed into a line graph:
+
+    - Original KG edges become line graph nodes.
+    - Two line graph nodes are connected if their corresponding KG edges
+      share an entity.
+    - Node features are built by concatenating the head entity embedding,
+      relation embedding, and tail entity embedding.
+    - Reasoning path annotations are converted into node-level labels.
+
+    The processed samples are stored individually as PyTorch files on disk,
+    allowing the dataset to handle large-scale knowledge graphs without
+    loading the complete dataset into memory.
+
+    Expected directory structure:
+
+        root/
+        ├── processed/
+        │   ├── train_retrieval.pkl
+        │   ├── valid_retrieval.pkl
+        │   └── test_retrieval.pkl
+        │
+        ├── emb/
+        │   ├── train.pth
+        │   ├── valid.pth
+        │   └── test.pth
+        │
+        ├── annotated_paths_LLM /
+        │   ├── train/
+        │   └── valid/
+        │
+        └── final/
+            ├── train/
+            │   ├── data_0.pt
+            │   ├── data_1.pt
+            │   └── ...
+            ├── valid/
+            └── test/
+
+    Parameters
+    ----------
+    root : str
+        Root directory containing the raw and processed dataset files. It should look like this: root=data_files/{dataset name}/
+
+    split : str, optional
+        Dataset split to load. Expected values are ``"train"``,
+        ``"valid"``, or ``"test"``.
+        Default is ``"valid"``.
+
+    transform : callable, optional
+        Optional PyTorch Geometric transform applied to each returned
+        ``Data`` object.
+
+    pre_transform : callable, optional
+        Optional PyTorch Geometric preprocessing transform applied before
+        saving processed graph objects.
+
+    Attributes
+    ----------
+    split : str
+        Current dataset split.
+
+    _files : list of str
+        List of processed graph filenames corresponding to the selected split.
+
+    Notes
+    -----
+    Each returned sample is a :class:`torch_geometric.data.Data` object
+    containing:
+
+    - ``x``:
+        Node feature matrix of the line graph.
+    - ``edge_index``:
+        Graph connectivity of the line graph.
+    - ``q_emb``:
+        Question embedding associated with the sample.
+    - ``topic_candidates``:
+        Binary labels indicating candidate nodes linked to question entities.
+    - ``path_label``:
+        Node-level supervision indicating the position of each node in
+        annotated reasoning paths.
+    - ``one_hop_neighbors``:
+        List representation of one-hop graph neighborhoods.
     """
 
-    def __init__(self, root, split="valid", transform=None, pre_transform=None):
+    def __init__(
+        self,
+        root,
+        split="train",
+        transform=None,
+        pre_transform=None,
+        text_encoder_name="sentence-transformers/all-MiniLM-L6-v2",
+        graph_processed_dir=None,
+        embedding_dir=None,
+        sample_limit=None,
+    ):
         """
-        Args:
-            root (str): Root directory where the dataset is stored.
-            split (str): One of ["train","valid","test"] (if you have multiple).
-            transform, pre_transform (callable): Optional PyG transforms.
-        """
+        Initialize the knowledge graph dataset.
+
+        The initialization performs the following operations:
+
+        1. Stores the selected dataset split.
+        2. Calls the parent PyTorch Geometric dataset initializer.
+        3. Identifies all processed graph files corresponding to the split.
+        4. Creates an internal file index used by :meth:`get` to retrieve
+           individual graph samples.
+
+        Parameters
+        ----------
+        root : str
+            Root directory containing the dataset files.
+
+        split : str, optional
+            Dataset split to load.
+
+            Supported values:
+            
+            - ``"train"``
+            - ``"val"``
+            - ``"test"``
+
+            Default is ``"train"``.
+
+        transform : callable, optional
+            Optional PyTorch Geometric transform applied when retrieving
+            samples.
+
+        pre_transform : callable, optional
+            Optional preprocessing transform applied before saving processed
+            samples.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the processed directory corresponding to the selected split
+            does not exist.
+
+        Notes
+        -----
+        Processed samples are expected to follow the naming convention::
+
+            data_0.pt
+            data_1.pt
+            data_2.pt
+            ...
+
+        Files are sorted numerically to preserve the original dataset order.
+    """
         self.split = split
+        self.text_encoder_name = text_encoder_name
+
+        if sample_limit is not None and sample_limit <= 0:
+            raise ValueError(
+                f"sample_limit must be strictly positive, got {sample_limit!r}."
+            )
+
+        self.sample_limit = sample_limit
+        self._embedding_dir = (
+            str(embedding_dir)
+            if embedding_dir is not None
+            else None
+        )
+        self._graph_processed_dir = (
+            str(graph_processed_dir)
+            if graph_processed_dir is not None
+            else None
+        )
         super().__init__(root, transform, pre_transform)
 
         # After calling super().__init__, self.process() is invoked (if needed).
@@ -65,8 +246,11 @@ class KGDataset(Dataset):
 
         # For example, if we stored each sample as:
         #   processed/data_0.pt, data_1.pt, data_2.pt, ...
+
         # we'll collect them in a list so we know how many there are.
-        processed_dir = os.path.join(self.processed_dir,self.split)
+
+        processed_dir = os.path.join(self.processed_dir, self.split)
+        
         # We look for files named like "{split}_data_0.pt", etc.
         self._files = []
         # List files in the directory (train/ or valid/)
@@ -79,6 +263,39 @@ class KGDataset(Dataset):
         # e.g. "valid/data_0.pt" -> index=0
 
     @property
+    def processed_dir(self):
+        """
+        Directory containing embedding-dependent PyG graph artifacts.
+
+        Legacy behavior is preserved when graph_processed_dir is not
+        provided: artifacts remain under <root>/processed.
+
+        Experimental runs can provide graph_processed_dir explicitly
+        to isolate graph artifacts generated with different embeddings.
+        """
+        if self._graph_processed_dir is not None:
+            return self._graph_processed_dir
+
+        return os.path.join(self.root, "processed")
+
+    @property
+    def embedding_dir(self):
+        """
+        Directory containing embedding .pth files.
+
+        An explicit directory can be supplied for experimental runs.
+        Otherwise the legacy location is preserved.
+        """
+        if self._embedding_dir is not None:
+            return self._embedding_dir
+
+        return os.path.join(
+            self.root,
+            "emb",
+            self.text_encoder_name,
+        )
+
+    @property
     def raw_file_names(self):
         """
         Specify the raw files that must exist before processing:
@@ -87,22 +304,26 @@ class KGDataset(Dataset):
           - annotated path folder
         """
         return [
-            os.path.join('processed',  f'{self.split}_retrieval.pkl'),
-            os.path.join('gte-large-en-v1.5', f'{self.split}.pth'),
-            os.path.join("annotated_paths_GPT4o", self.split)
+            os.path.join(f'{self.root}','processed',  f'{self.split}_retrieval.pkl'),
+            os.path.join(
+                self.embedding_dir,
+                f"{self.split}.pth",
+            ),
+            os.path.join(f'{self.root}',"annotated_paths_LLM", self.split)
         ]
 
     @property
     def processed_file_names(self):
         """
-        Instead of one big file, we have many: e.g. "train_data_0.pt" ... "train_data_N.pt"
-        But PyG needs *some* reference. We could just return an empty list or
-        a single placeholder. We'll return an empty list to let PyG know that
-        we handle enumerating processed files ourselves.
+        A split is considered fully processed only when its completion
+        marker exists.
+
+        The marker is created at the end of process(), after every graph
+        and metadata file has been successfully saved.
         """
-        
-        # return ['train/']
-        return ['train/','val/','test/']
+        return [
+            os.path.join(self.split, "_SUCCESS")
+        ]
 
     def download(self):
         # No downloading; we assume raw data is provided locally
@@ -120,26 +341,57 @@ class KGDataset(Dataset):
         """
         
         # 1) Load your raw data, embeddings, etc.
-        print ('self.raw_dir:',self.raw_dir)
-        retrieval_path = os.path.join(self.raw_dir, "processed", f"{self.split}_retrieval.pkl")
-        emb_path       = os.path.join(self.raw_dir, "gte-large-en-v1.5", f"{self.split}.pth")
-        label_path     = os.path.join(self.raw_dir, "annotated_paths_GPT4o", self.split)
+        #for debugging
+        # retrieval_path = os.path.join('RAPL',f'{self.root}',"processed", f"{self.split}_retrieval.pkl")
+        # emb_path       = os.path.join('RAPL',f'{self.root}',"emb/sentence-transformers/all-MiniLM-L6-v2", f"{self.split}.pth")
+        # label_path     = os.path.join('RAPL',f'{self.root}',"annotated_paths_LLM", self.split)
 
-        if not os.path.exists(retrieval_path) or not os.path.exists(emb_path):
-            print (retrieval_path)
-            print (emb_path)
-            print(f"[Warning] Missing raw data for {self.split}, skipping process.")
-            sys.exit(1)
-            return
+        retrieval_path = os.path.join(f'{self.root}',"processed", f"{self.split}_retrieval.pkl")
+        emb_path = os.path.join(
+            self.embedding_dir,
+            f"{self.split}.pth",
+        )
+        label_path     = os.path.join(f'{self.root}',"annotated_paths_LLM", self.split)
+        missing_inputs = [
+                            path
+                            for path in (retrieval_path, emb_path)
+                            if not os.path.exists(path)
+                        ]
+
+        if missing_inputs:
+            raise FileNotFoundError(
+                f"Missing input files for split={self.split}: "
+                f"{missing_inputs}"
+            )
+       
         print ('loading pickle files')
         s = time.time()
         with open(retrieval_path, "rb") as f:
             retrieval_data = pickle.load(f)  # e.g. List[Dict]
+
+        source_retrieval_count = len(retrieval_data)
+
+        if self.sample_limit is not None:
+            if self.sample_limit > source_retrieval_count:
+                raise ValueError(
+                    f"sample_limit={self.sample_limit} exceeds "
+                    f"retrieval size={source_retrieval_count} "
+                    f"for split={self.split!r}."
+                )
+
+            retrieval_data = retrieval_data[:self.sample_limit]
+
+        print(
+            f"Retrieval samples: {len(retrieval_data)} "
+            f"(source={source_retrieval_count}, "
+            f"limit={self.sample_limit})"
+        )
+
         print ('time cost:',time.time()-s)
         print ('loading tensor to cpu')
         emb_data = torch.load(emb_path,map_location='cpu') 
         print ('collecting text labels')
-        text_labels = None
+        text_labels = None #text_labels is a list containing all the relation labels in the RationalPaths(annotated by the LLM)
         if os.path.isdir(label_path):
             text_labels = self._collect_annotated_paths(label_path)
 
@@ -150,7 +402,7 @@ class KGDataset(Dataset):
         self.min_len_indices = []
         metadata_list = []
 
-        out_dir = os.path.join(self.processed_dir, self.split)
+        out_dir = os.path.join(self.processed_dir, self.split)#maybe change to "final  "
         os.makedirs(out_dir, exist_ok=True)
 
         for idx, sample in enumerate(tqdm(retrieval_data)):
@@ -174,6 +426,75 @@ class KGDataset(Dataset):
 
         with open(os.path.join(out_dir, f"metadata_{self.split}.pkl"), "wb") as f:
             pickle.dump(metadata_list, f)
+
+        # Experimental graph variants carry a provenance manifest.
+        # Legacy <root>/processed artifacts remain completely unchanged.
+        if self._graph_processed_dir is not None:
+            if len(retrieval_data) == 0:
+                raise ValueError(
+                    f"Cannot write graph manifest for empty split {self.split!r}."
+                )
+
+            first_graph = torch.load(
+                os.path.join(out_dir, "data_0.pt"),
+                map_location="cpu",
+                weights_only=False,
+            )
+
+            feature_dim = int(first_graph.x.shape[1])
+
+            if feature_dim % 3 != 0:
+                raise ValueError(
+                    f"Unexpected graph feature dimension for split={self.split!r}: "
+                    f"{feature_dim} is not divisible by 3."
+                )
+
+            embedding_dim = feature_dim // 3
+
+            graph_manifest = {
+                "schema_version": 1,
+                "dataset_name": os.path.basename(
+                    os.path.normpath(self.root)
+                ),
+                "split": self.split,
+                "embedding_model": self.text_encoder_name,
+                "embedding_dim": embedding_dim,
+                "sample_count": len(retrieval_data),
+                "retrieval_path": retrieval_path,
+                "retrieval_sha256": _sha256_file(retrieval_path),
+                "embedding_path": emb_path,
+                "embedding_sha256": _sha256_file(emb_path),
+            }
+
+            manifest_path = os.path.join(
+                out_dir,
+                "graph_manifest.json",
+            )
+            temporary_manifest_path = manifest_path + ".tmp"
+
+            with open(
+                temporary_manifest_path,
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(
+                    graph_manifest,
+                    f,
+                    indent=2,
+                    sort_keys=True,
+                )
+                f.write("\n")
+
+            os.replace(
+                temporary_manifest_path,
+                manifest_path,
+            )
+
+        # Mark this split as complete only after every output was saved.
+        success_path = os.path.join(out_dir, "_SUCCESS")
+
+        with open(success_path, "w", encoding="utf-8") as file:
+            file.write(f"{len(retrieval_data)}\n")
 
     def _process_single_sample(self, sample, emb_data, text_labels, idx):
         """
@@ -229,10 +550,11 @@ class KGDataset(Dataset):
         matched_paths_triplets = []
 
         if text_labels is not None:
+            # print(idx, len(text_labels))
             # text_labels[idx] is a list of ground-truth path tuples, e.g. [('a.b.c','d.e.f'), ...]
             ground_truth_tuples = text_labels[idx]  # => the ground-truth for this sample
 
-            # 3a) Attempt to match them with the candidate reasoning paths
+            # 3a) Making sure that the extracting from the LLM rational labeling matches the reasoning paths (extracted by a deterministic )
             matched_indices, min_length_indices = self._match_candidate_paths(
                 ground_truth_tuples, reasoning_paths
             )
@@ -275,16 +597,29 @@ class KGDataset(Dataset):
         # Mark nodes whose head-entity is in q_entity_id_list
         question_ent_id_set = set(q_entity_id_list)
         num_nodes = data_obj.num_nodes
+
+        #here we create two tensor to: gather nodes which have a h-entity in the list of question_entities
         topic_candidates = torch.zeros(num_nodes, dtype=torch.long)
-        gpt_labeled_topic_candidates = torch.zeros(num_nodes, dtype=torch.long)
+        llm_labeled_topic_candidates = torch.zeros(num_nodes, dtype=torch.long)
+        
         for node_idx in range(num_nodes):
             h_ent = meta_data[node_idx]['h_id']
             if h_ent in question_ent_id_set:
                 topic_candidates[node_idx] = 1
         topic_indices = get_topic_entity_from_path_label(data_obj.path_label,data_obj.x.shape[0])
         for t in topic_indices:
-            gpt_labeled_topic_candidates[t] = 1
+            llm_labeled_topic_candidates[t] = 1
+
+
         data_obj.topic_candidates = topic_candidates.unsqueeze(-1)  # shape [num_nodes, 1]
+
+        data_obj.llm_topic_labels = (
+           llm_labeled_topic_candidates.unsqueeze(-1)
+        )
+        data_obj.topic_labels = (
+                   llm_labeled_topic_candidates.unsqueeze(-1)
+                )
+        
 
         # data_obj is now ready for saving/returning
         return data_obj, meta_data, min_len_indices_sample
@@ -353,6 +688,7 @@ class KGDataset(Dataset):
             if use_entity_feature and (entity_embs is not None):
                 h_emb = entity_embs[h_idx] if 0 <= h_idx < entity_embs.shape[0] else torch.zeros(entity_emb_dim)
                 t_emb = entity_embs[t_idx] if 0 <= t_idx < entity_embs.shape[0] else torch.zeros(entity_emb_dim)
+                #here is the embdding of the triple (part of the conversion in LineGraph)
                 node_feature = torch.cat([h_emb, rel_emb, t_emb], dim=0)
             else:
                 node_feature = rel_emb
@@ -421,41 +757,142 @@ class KGDataset(Dataset):
         for txt_file in txt_files_sorted:
             parsed = self._parse_rational_paths(folder_path, txt_file)
             parsed_paths_list.append(parsed)
+            # print(parsed_paths_list)
         return parsed_paths_list
 
+    # def _parse_rational_paths(self, file_dir, file_name):
+        
+    #     """
+    #     Given a directory (file_dir) and a file name (file_name) that points to a text file
+    #     (e.g. file_dir='path/to' and file_name='sample_1.txt'), this function reads and parses
+    #     all lines after the phrase "The rational paths are:". Each path line in the file is
+    #     expected to follow this format:
+
+    #         1. [location.location.partially_contains, geography.river.basin_countries]
+    #         2. [location.location.time_zones]
+    #         3. [other.path.example]
+
+    #     The function extracts each bracketed sequence, splits by commas, and creates a tuple
+    #     of strings. It then collects these tuples into a list and returns it.
+    #     """
+        
+    #     full_path = os.path.join(file_dir, file_name)
+    #     lines = []
+    #     with open(full_path, 'r', encoding='utf-8') as f:
+    #         lines = f.readlines()
+    #     parsed_paths = []
+    #     in_section = False
+    #     pattern = re.compile(r'^\s*\d+\.\s*(.*)$')
+    #     for line in lines:
+    #         if "The rational paths" in line:
+    #             in_section = True
+    #             continue
+    #         if in_section:
+    #             match =  .match(line.strip())
+    #             if match:
+    #                 bracket_content = match.group(1)
+    #                 parts = [p.strip() for p in bracket_content.split(',')]
+    #                 parsed_paths.append(tuple(parts))
+    #     return parsed_paths
+    
     def _parse_rational_paths(self, file_dir, file_name):
-        
         """
-        Given a directory (file_dir) and a file name (file_name) that points to a text file
-        (e.g. file_dir='path/to' and file_name='sample_1.txt'), this function reads and parses
-        all lines after the phrase "The rational paths are:". Each path line in the file is
-        expected to follow this format:
+        Parse LLM-generated rational paths from a text file.
 
-            1. [location.location.partially_contains, geography.river.basin_countries]
-            2. [location.location.time_zones]
-            3. [other.path.example]
+        Expected formats:
 
-        The function extracts each bracketed sequence, splits by commas, and creates a tuple
-        of strings. It then collects these tuples into a list and returns it.
+            1. sepsis -> has_symptom -> headache
+
+            1. **Pneumonia -> Treated By -> Corticosteroids**
+            Explanation...
+
+            2. **Pneumonia -> Has Symptom -> Hypertension -> Tackled By -> Corticosteroids**
+
+        Returns
+        -------
+        list of tuples
+            Each tuple contains the ordered relations of one reasoning path.
+
+        Example:
+            (
+                ('has_symptom',),
+                ('Has Symptom', 'Tackled By')
+            )
         """
-        
+
         full_path = os.path.join(file_dir, file_name)
-        lines = []
-        with open(full_path, 'r', encoding='utf-8') as f:
+
+        with open(full_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
+
         parsed_paths = []
         in_section = False
-        pattern = re.compile(r'^\s*\d+\.\s*\[(.*?)\]\s*$')
+
+        # Matches:
+        # 1.
+        # 1)
+        # 1:
+        pattern = re.compile(
+            r'^\s*\d+\s*[\.\):\-]\s*(.*)$'
+        )
+
         for line in lines:
-            if "The rational paths are:" in line:
+
+            if "rational path" in line:
                 in_section = True
                 continue
-            if in_section:
-                match = pattern.match(line.strip())
-                if match:
-                    bracket_content = match.group(1)
-                    parts = [p.strip() for p in bracket_content.split(',')]
-                    parsed_paths.append(tuple(parts))
+
+            if not in_section:
+                continue
+
+            cleaned = line.strip()
+
+            # Ignore empty lines
+            if not cleaned:
+                continue
+
+            # Remove markdown bullets and emphasis
+            cleaned = cleaned.strip("*").strip("-").strip()
+
+            match = pattern.match(cleaned)
+
+            if not match:
+                continue
+
+            path_text = match.group(1).strip()
+
+            # Remove markdown bold/italic markers anywhere around the path
+            path_text = re.sub(r'^\*+|\*+$', '', path_text).strip()
+
+            # Keep only the path before explanations
+            if "\n" in path_text:
+                path_text = path_text.split("\n")[0]
+
+            # Need arrow-separated paths
+            if "->" not in path_text:
+                continue
+
+            # Split entities and relations
+            elements = [
+                x.strip()
+                for x in path_text.split("->")
+                if x.strip()
+            ]
+
+            # A valid path must be:
+            # entity -> relation -> entity
+            # or longer
+            if len(elements) < 3:
+                continue
+
+            # Extract relations (middle elements)
+            relations = tuple(
+                elements[i]
+                for i in range(1, len(elements)-1, 2)
+            )
+
+            parsed_paths.append(relations)
+
         return parsed_paths
 
 
@@ -537,7 +974,6 @@ class KGDataset(Dataset):
         return matched_indices, min_length_indices
 
 
-
     def _paths_to_triplets(self, id2entities, id2relations, paths):
         """
         Given a list of path strings, each describing a path in the form:
@@ -594,6 +1030,7 @@ class KGDataset(Dataset):
         """
         fname = self._files[idx]
         fpath = os.path.join(self.processed_dir,self.split, fname)
-        data_obj = torch.load(fpath)
+        data_obj = torch.load(fpath,weights_only=False)
         return data_obj
     
+

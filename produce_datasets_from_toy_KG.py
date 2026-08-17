@@ -179,11 +179,11 @@ G.add_edge("sepsis", "antibiotics", label="treatment", relation="treated_by")
 G.add_edge("sepsis", "cortisone", label="treatment", relation="treated_by")
 G.add_edge("sepsis", "nutritional_supplements", label="treatment", relation="treated_by")
 
-G.add_edge("sepsis", "confusion", label="symptom", relation="has_symtom")
-G.add_edge("sepsis", "fever", label="symptom", relation="has_symtom")
-G.add_edge("sepsis", "headache", label="symptom", relation="has_symtom")
-G.add_edge("sepsis", "skin_redness", label="symptom", relation="has_symtom")
-G.add_edge("sepsis", "hypertension", label="symptom", relation="has_symtom")
+G.add_edge("sepsis", "confusion", label="symptom", relation="has_symptom")
+G.add_edge("sepsis", "fever", label="symptom", relation="has_symptom")
+G.add_edge("sepsis", "headache", label="symptom", relation="has_symptom")
+G.add_edge("sepsis", "skin_redness", label="symptom", relation="has_symptom")
+G.add_edge("sepsis", "hypertension", label="symptom", relation="has_symptom")
 
 G.add_edge("pneumonia", "infection", label="description", relation="is_an")
 
@@ -191,8 +191,8 @@ G.add_edge("pneumonia", "respiratory_assistance", label="treatment", relation="t
 G.add_edge("pneumonia", "antibiotics", label="treatment", relation="treated_by")
 G.add_edge("pneumonia", "cortisone", label="treatment", relation="treated_by")
 
-G.add_edge("pneumonia", "hypertension", label="symptom", relation="has_symtom")
-G.add_edge("pneumonia", "cough", label="symptom", relation="has_symtom")
+G.add_edge("pneumonia", "hypertension", label="symptom", relation="has_symptom")
+G.add_edge("pneumonia", "cough", label="symptom", relation="has_symptom")
 
 
 G.add_edge("indigestion", "stomach_cleansing", label="treatment", relation="treated_by")
@@ -348,7 +348,7 @@ def neighbors_by_relation(G, node, relation=None):
             out.append((h, data["relation"], t))
     return out
 
-def generate_dataset(G, n_samples=200):
+def generate_dataset(G, n_samples=20):
     """
     Generate a synthetic dataset following the WebQSP format.
 
@@ -466,7 +466,7 @@ def generate_dataset(G, n_samples=200):
             symptom_edges = neighbors_by_relation(
                 G,
                 disease,
-                "has_symtom"
+                "has_symptom"
             )
 
             if not symptom_edges:
@@ -676,7 +676,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--n_samples", type=int, default=200)
+    parser.add_argument("--n_samples", type=int, default=20)
     parser.add_argument("--train_ratio", type=float, default=0.8)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--test_ratio", type=float, default=0.1)
@@ -686,3 +686,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(args)
+

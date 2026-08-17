@@ -1,4 +1,5 @@
-#update : 03/08 9:29
+#update: 10/08 21:28
+
 import os
 import sys
 import pickle
@@ -10,7 +11,8 @@ from xml.parsers.expat import model
 from tqdm import tqdm
 from termcolor import colored
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from src.model.llms import TransformersLLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 def chat(args):
     """
@@ -38,6 +40,7 @@ def chat(args):
         - train_part: -1 for the entire training set; 0, 1, or 2 for splitting the
           training data into three parts.
         - split: commanding which split to process. Default is 'train', options are: ['train', 'val', 'test', 'all']
+        - llm_name: str pointing which LLM model to use for the annotation, default is Qwen/Qwen2.5-7B-Instruct
     
     Outputs:
     --------
@@ -64,21 +67,28 @@ def chat(args):
     #     openai.api_key = "xxx"  # Replace with your actual API key
 
     #loading the model and tokenizer
-    model_name = "Qwen/Qwen2.5-0.5B-Instruct"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype="auto"
-        )    
+    # model_name = args.llm_name
+    # tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # model = AutoModelForCausalLM.from_pretrained(
+    #         model_name,
+    #         torch_dtype="auto"
+    #     )    
 
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
-    print(device)
+    # device = torch.device(
+    #     "cuda" if torch.cuda.is_available() else "cpu"
+    # )
+    # print(device)
 
-    model.to(device)
-    model.eval()
+    # model.to(device)
+    # model.eval()
     split=args.split
+    llm_name = args.llm_name
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    llm = TransformersLLM(
+                    model_name=llm_name, #Qwen/Qwen3.5-35B-A3B-FP8, Qwen/Qwen2.5-0.5B-Instruct
+                    device=device
+                    )
 
     # Create output directory if needed
     os.makedirs(args.out_dir, exist_ok=True)
@@ -131,50 +141,42 @@ def chat(args):
         Output:
         A string that we feed into the 'content' of a 'user' role message.
         """
-        prompt_str = (   # try without examples
-            f"We have the question:\n\n{question}\n\n"
-            f"And a set of relations for this question:\n\n{cand_relations}\n\n"
-            "List the relevant relations for this question. Please respond using the following format:\n\n"
-            "<Solution:> [r1,r2,....] \n\n"
+        # prompt_str = (   # try without examples
+        #     f"We have the question:\n\n{question}\n\n"
+        #     f"And a set of relations for this question:\n\n{cand_relations}\n\n"
+        #     "List the relevant relations for this question. Please respond using the following format:\n\n"
+        #     "<Solution:> [r1,r2,....] \n\n"
+        # )
+        prompt_str = (
+        f"You are given a question and a list of candidate relations.\n\n"
+        f"Question:\n"
+        f"{question}\n\n"
+
+        f"Candidate relations:\n"
+        f"{cand_relations}\n\n"
+
+        "Task:\n"
+        "Select all and only the candidate relations that are relevant "
+        "for answering the question.\n\n"
+
+        "IMPORTANT RULES:\n"
+        "1. You MUST select relations only from the provided candidate relations.\n"
+        "2. DO NOT invent, modify, paraphrase, translate, or combine relations.\n"
+        "3. Copy the selected relation strings EXACTLY as they appear in "
+        "the candidate relations.\n"
+        "4. If no candidate relation is relevant, return an empty list: [].\n"
+        "5. Do not include explanations, reasoning, comments, or additional text.\n"
+        "6. Your entire response MUST follow exactly this format:\n\n"
+
+        "Solution: [r1,r2,...]\n\n"
+
+        "Return ONLY the Solution line."
+
         )
+
         return prompt_str
     
     """
-    def gpt_call(prompt):
-        
-        Sends a chat completion request to OpenAI's API using the messages
-        in 'prompt'. This function continually retries on error.
-
-        Input:
-        ------
-        prompt: List[dict]
-            Example structure:
-            [
-            {"role": "system", "content": "..."},
-            {"role": "user",   "content": "..."}
-            ]
-
-        Output:
-        -------
-        str
-            The content of the assistant's response.
-        
-        
-        while True:
-            try:
-                response = openai.ChatCompletion.create(
-                    model="gpt-4o-mini",
-                    messages=prompt,
-                    temperature=0.0,
-                )
-                return response["choices"][0]["message"]["content"]
-
-            except openai.error.RateLimitError:
-                print(colored("Rate limit reached. Waiting 60 seconds...", 'red'))
-                time.sleep(60)
-                # Retry with the same prompt in the next loop iteration
-    """
-
     def llm_call(prompt):
 
         text = tokenizer.apply_chat_template(
@@ -199,7 +201,6 @@ def chat(args):
                 max_new_tokens=256,
                 do_sample=True,
                 pad_token_id=tokenizer.eos_token_id,
-                temperature=0.8
             )
 
         generated = outputs[:, inputs["input_ids"].shape[1]:]
@@ -210,8 +211,58 @@ def chat(args):
         )[0]
 
         return answer.strip()
+    """
+    @torch.inference_mode()
+    def llm_call_batch(prompts):
+
+        texts = [
+            tokenizer.apply_chat_template(
+                p,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            for p in prompts
+        ]
+
+
+        inputs = tokenizer(
+            texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            padding_side="left"
+        ).to(device)
+
+
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=128,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+
+        answers = []
+
+        for output, input_ids in zip(
+            outputs,
+            inputs["input_ids"]
+        ):
+
+            generated = output[input_ids.shape[-1]:]
+
+            answer = tokenizer.decode(
+                generated,
+                skip_special_tokens=True
+            )
+
+            answers.append(answer.strip())
+
+
+        return answers
+
     
-    def process_data(data_list):
+    def process_data(data_list,batch_size=16):
         """
         Processes a list of data items. Each data item is a dictionary:
             {
@@ -224,45 +275,103 @@ def chat(args):
 
         Inputs:
         data_list: list of dictionaries
+        batch_size: size of the batch
 
         Output:
         A list of dictionaries, each containing the question, candidate relations,
         and the LLM response text.
         """
+
         results = []
-        for i in tqdm(range(len(data_list)), desc="Processing data"):
-        
-            item = data_list[i][i] 
-          
-            q = item["question"]
-            cand_rels = list(item["cand_relations"])
-            gt_relations = list(item["gt_relations"])
 
-            user_prompt = build_prompt(q, cand_rels)
-            messages = [
-                system_message,
-                {"role": "user", "content": user_prompt}
-            ]
-            #old version with OpenAI API call
-            #response_text = gpt_call(messages)
-            response_text = llm_call(messages)
 
-            results.append({
-                "question": q,
-                "cand_relations": cand_rels,
-                "response_text": response_text,
-                "gt_relations": gt_relations
-            })
+        for start in tqdm(
+            range(0, len(data_list), batch_size),
+            desc="Processing data"
+        ):
+
+            batch_messages = []
+            batch_items = []
+
+
+            for idx in range(
+                start,
+                min(start + batch_size, len(data_list))
+            ):
+
+                item = data_list[idx][idx]
+
+
+                q = item["question"]
+
+                cand_rels = list(
+                    item["cand_relations"]
+                )
+
+                gt_relations = list(
+                    item["gt_relations"]
+                )
+
+
+                user_prompt = build_prompt(
+                    q,
+                    cand_rels
+                )
+
+
+                messages = [
+                    system_message,
+                    {
+                        "role": "user",
+                        "content": user_prompt
+                    }
+                ]
+
+
+                batch_messages.append(messages)
+
+                batch_items.append(
+                    (
+                        q,
+                        cand_rels,
+                        gt_relations
+                    )
+                )
+
+
+            # responses = llm_call_batch(
+            #     batch_messages
+            # )
+            responses = llm.generate(batch_messages)
+
+
+            for item, response in zip(
+                batch_items,
+                responses
+            ):
+
+                q, cand_rels, gt_relations = item
+
+                results.append(
+                    {
+                        "question": q,
+                        "cand_relations": cand_rels,
+                        "response_text": response,
+                        "gt_relations": gt_relations
+                    }
+                )
+
 
         return results
 
+    batch_size=16
     if split=='train' or split=='all':
         #########################################
         #########For the train split #############
         #########################################
         start_idx = 0 #reset
         print(colored(f"Processing training set (size={len(train_data)}).", 'green'))
-        train_results = process_data(train_data)
+        train_results = process_data(train_data,batch_size)
     
         # Save all results to out_dir as pickle files
         with open(os.path.join(args.out_dir, "train_results.pkl"), "wb") as f:
@@ -274,7 +383,7 @@ def chat(args):
         #########################################
         start_idx = 0 #reset
         print(colored(f"Processing val set (size={len(val_data)}).", 'green'))
-        val_results = process_data(val_data)
+        val_results = process_data(val_data,batch_size)
     
         # Save all results to out_dir as pickle files
         with open(os.path.join(args.out_dir, "val_results.pkl"), "wb") as f:
@@ -286,7 +395,7 @@ def chat(args):
         #########################################
         start_idx = 0 #reset
         print(colored(f"Processing test set (size={len(test_data)}).", 'green'))
-        test_results = process_data(test_data)
+        test_results = process_data(test_data, batch_size)
     
         # Save all results to out_dir as pickle files
         with open(os.path.join(args.out_dir, "test_results.pkl"), "wb") as f:
@@ -299,16 +408,17 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument(
         "--input_path",
-        default="data_files/toy/processed",
+        default="data_files/OntoOmicsKG_step2/processed",
     )
-    parser.add_argument('--out_dir', type=str, default="data_files/toy/relationtargeting/", help='Directory to save the results')
+    parser.add_argument('--out_dir', type=str, default="data_files/OntoOmicsKG_step2/relationtargeting/Qwen/Qwen2.5-0.5B-Instruct", help='Directory to save the results')
     #parser.add_argument('--which_key', type=int, default=0, choices=[0,1,2], help='Which OpenAI key to use')
     parser.add_argument('--train_part', type=int, default=-1,
                         choices=[-1,0,1,2],
                         help='-1 means use the entire training set; 0,1,2 for splitting the dataset into thirds')
     parser.add_argument('--split', type=str, default='all',
                                 choices=['train','val','test','all'], help='which split to process')
-
+    parser.add_argument('--llm_name', type=str, default='Qwen/Qwen2.5-0.5B-Instruct',
+                                choices=['Qwen/Qwen2.5-0.5B-Instruct','Qwen/Qwen2.5-7B-Instruct','Qwen/Qwen2.5-14B-Instruct','Qwen/Qwen3.5-35B-A3B-FP8'], help='which LLM does the annotation')
     args = parser.parse_args()
     chat(args)
 

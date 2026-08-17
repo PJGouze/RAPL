@@ -1,3 +1,4 @@
+#update: 09/08 12:17
 import numpy as np
 import os
 import sys
@@ -13,7 +14,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.config.retriever import load_yaml
-from src.dataset.retriever_v2 import RetrieverDataset, collate_retriever
+from src.dataset.retriever_v3 import RetrieverDataset, collate_retriever
 # from src.dataset.calc_path_distance import RetrieverDataset
 from src.model.retriever import Retriever
 from src.setup import set_seed, prepare_sample
